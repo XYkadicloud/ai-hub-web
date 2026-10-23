@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Hub</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="side-head">
+          <div class="logo">AI&nbsp;Hub</div>
+          <button id="newChat" title="新对话">＋</button>
+        </div>
+        <div id="convList" class="conv-list"></div>
+        <div class="side-foot">
+          <button id="openSettings" class="ghost">⚙ 设置 / 账号池</button>
+        </div>
+      </aside>
+
+      <main id="main">
+        <header id="topbar">
+          <select id="providerSel" class="select" title="服务"></select>
+          <select id="modelSel" class="select" title="模型"></select>
+          <div id="accountChip" class="account-chip" title="当前账号">
+            <span class="dot"></span><span class="txt">—</span>
+          </div>
+          <button id="openAccounts" class="ghost sm" title="账号池">👤 账号</button>
+        </header>
+
+        <div id="messages" class="messages"></div>
+
+        <div id="composer">
+          <textarea
+            id="input"
+            placeholder="给 AI 发消息…  (Enter 发送 / Shift+Enter 换行)"
+          ></textarea>
+          <div class="composer-btns">
+            <button id="stop" class="hidden" title="停止">■</button>
+            <button id="send" title="发送">➤</button>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- 设置 / 账号池 弹窗 -->
+    <div id="settingsModal" class="modal hidden">
+      <div class="modal-box">
+        <div class="modal-head">
+          <div class="tabs">
+            <button class="tab active" data-tab="svc">服务 / 反代</button>
+            <button class="tab" data-tab="acct">账号池</button>
+          </div>
+          <button id="closeSettings" class="ghost">✕</button>
+        </div>
+
+        <!-- 服务/反代 -->
+        <div id="tab-svc" class="tab-pane">
+          <div id="providerCards" class="prov-cards"></div>
+          <button id="addProvider" class="ghost">＋ 添加自定义端点</button>
+        </div>
+
+        <!-- 账号池 -->
+        <div id="tab-acct" class="tab-pane hidden">
+          <div class="acct-toolbar">
+            <select id="acctProviderSel" class="select"></select>
+            <button id="webLoginBtn" class="primary sm">🌐 网页登录抓 Token</button>
+            <button id="keyAddBtn" class="ghost sm">＋ 手动填 Key</button>
+          </div>
+          <div id="accountList" class="account-list"></div>
+          <p class="hint">
+            账号按优先级从高到低尝试；异常（失效/被封/额度耗尽）时自动切到下一个健康账号。
+          </p>
+        </div>
+
+        <div class="modal-foot">
+          <div id="buildInfo" class="build-info"></div>
+          <button id="saveSettings" class="primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 添加 API Key 弹窗 -->
+    <div id="keyModal" class="modal hidden">
+      <div class="modal-box capture-box">
+        <div class="modal-head">
+          <div id="keyTitle" class="cap-title">添加 API Key</div>
+          <button id="closeKey" class="ghost">✕</button>
+        </div>
+        <div class="cap-body">
+          <div id="keyHint" class="cap-steps"></div>
+          <label class="cap-label">账号备注（自己看得懂就行，可留空）</label>
+          <input id="keyName" class="key-input" placeholder="例如：Gemini-免费号1" autocomplete="off">
+          <label class="cap-label">API Key / Token</label>
+          <textarea id="keySecret" rows="3" placeholder="直接粘贴，首尾空格与换行会自动清理" spellcheck="false"></textarea>
+          <div id="keyStatus" class="cap-status"></div>
+        </div>
+        <div class="modal-foot">
+          <button id="keyCancel" class="ghost">取消</button>
+          <button id="keyForce" class="ghost hidden">仍然保存</button>
+          <button id="keySave" class="primary">验证并添加</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 网页登录抓取弹窗 -->
+    <div id="captureModal" class="modal hidden">
+      <div class="modal-box capture-box">
+        <div class="modal-head">
+          <div id="capTitle" class="cap-title">抓取登录 Token</div>
+          <button id="closeCapture" class="ghost">✕</button>
+        </div>
+        <div class="cap-body">
+          <div id="capSteps" class="cap-steps"></div>
+          <label class="cap-label" id="capInputLabel">粘贴 Token</label>
+          <textarea id="capInput" rows="4" placeholder=""></textarea>
+          <div id="capCookieWrap" class="hidden">
+            <label class="cap-label">Cookie（可选，推荐一并粘贴以提高成功率）</label>
+            <textarea id="capCookie" rows="3" placeholder="从浏览器复制的完整 Cookie"></textarea>
+          </div>
+          <div id="capStatus" class="cap-status"></div>
+        </div>
+        <div class="modal-foot">
+          <button id="capVerify" class="ghost">仅验证</button>
+          <button id="capAdd" class="primary">验证并添加</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toasts"></div>
+
+    <script src="vendor/marked.min.js"></script>
+    <script src="vendor/tauri-shim.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

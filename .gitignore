@@ -1,0 +1,15 @@
+# 构建产物
+/target
+*.pdb
+
+# 运行时数据（若误放在项目目录）
+/startup.log
+/data
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.vscode/
+.idea/

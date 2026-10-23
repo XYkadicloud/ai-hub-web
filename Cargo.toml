@@ -1,0 +1,31 @@
+[package]
+name = "ai-hub-web"
+version = "0.1.0"
+description = "轻量一站式 AI 聊天整合客户端 · 本地服务 + 浏览器版（无 WebView2 依赖）"
+edition = "2021"
+
+[[bin]]
+name = "ai-hub-web"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+rust-embed = "8"
+tokio-stream = { version = "0.1", features = ["sync"] }
+open = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+url = "2"
+sha3 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+panic = "abort"
+strip = true
+opt-level = "s"
+codegen-units = 1
