@@ -1,6 +1,6 @@
 # AI Hub Web · 交接文档
 
-> 版本：v0.1.0　｜　最后更新：2026-10-23
+> 版本：v0.1.0　｜　最后更新：2026-10-24
 > 定位：轻量级「一站式 AI 聊天客户端」，本地 HTTP 服务 + 系统默认浏览器，零 WebView2 依赖。
 
 ---
@@ -9,9 +9,10 @@
 
 一个跑在 Windows 上的单文件程序（约 5MB）。双击后：
 
-1. 在本机 `127.0.0.1` 的**随机端口**起一个 HTTP 服务；
+1. 在本机 `127.0.0.1:25880`（**固定端口**，被占用才回退随机）起一个 HTTP 服务；
 2. 自动用**系统默认浏览器**打开界面（Edge / Chrome 都行）；
-3. 界面是 ChatGPT 风格的暗色聊天 UI，左侧会话列表、流式打字机、Markdown 渲染。
+3. 界面是 ChatGPT 风格的暗色聊天 UI，左侧会话列表、流式打字机、Markdown 渲染；
+4. 页面关闭后服务端自动退出（前端 5s 心跳 + `pagehide` 时 `sendBeacon /api/quit` 设 8s 死线）。
 
 **设计目标**：弱机可用（4GB 内存 / Intel N3060 级别），不需要 WebView2、Node、Python。
 
@@ -29,8 +30,8 @@
 |---|---|---|
 | OpenAI 兼容协议（DeepSeek / 中转站 / 自建反代） | ✅ | mock 服务端到端 + 真实 HTTPS 探测 |
 | Gemini **原生**协议（非兼容层） | ✅ | mock 原生协议端到端 |
-| ChatGPT 网页版协议（含 PoW 求解） | ✅ 代码完成 | 协议级 mock（含服务端 PoW 校验） |
-| Claude 网页版协议（sessionKey） | ✅ 代码完成 | 协议级 mock |
+| ChatGPT 网页版协议（含 PoW 求解） | ✅ **真机跑通** | 真实 OAuth 账号对话 + 多轮上下文 |
+| Claude 网页版协议（sessionKey） | ⚠️ 协议跑通，账号限流 | 真机 429（额度问题，非代码问题） |
 | 账号池 + 自动故障转移（401/403/429/额度） | ✅ | mock 触发切换 |
 | 多轮上下文（含网页版会话/父消息 ID 持久化） | ✅ | 两协议第二轮测试 |
 | 会话历史本地持久化 | ✅ | 跨重启读取 |
@@ -49,8 +50,8 @@
 
 | 项 | 说明 |
 |---|---|
-| **ChatGPT / Claude 真实账号实测** | 开发环境无登录态，只用「严格复刻官方协议的 mock」验证。真机上若失效，大概率是官方改了接口，不是代码逻辑错 |
-| **OAuth 真机登录** | 按 `yukkcat/chatgpt2api` 的公开流程实现（authorize/code 兑换/refresh），首次真机使用若报错，优先核对 `state` 与回调 URL 完整性 |
+| **ChatGPT 真机实测** | 已跑通（OAuth 账号，单轮 + 多轮）；Claude 真机卡在账号 429 限流 |
+| **OAuth 真机登录** | 已跑通（Codex loopback 全自动）。若报错，优先核对 `state`、端口是否被防火墙拦 |
 | **Gemini 国内直连** | `generativelanguage.googleapis.com` 国内需代理，无代理不可用 |
 | **ChatGPT / Claude 网页版** | 同样需要能访问对应站点（需代理） |
 | **语音识别** | 产品决策：不做（浏览器原生/后端 whisper 均不实现） |
@@ -189,15 +190,26 @@ tauri-shim.js  ──把 __TAURI__.core.invoke 翻译成 fetch──┐
 
 1. **取 dpl**：GET `https://chatgpt.com/`，用正则 `c/[^/]*/_` 从 script src 里提取部署指纹；
    失败则回退 `DEFAULT_DPL` 常量。
-2. **chat-requirements**：POST `/backend-api/sentinel/chat-requirements`
+2. **chat-requirements**：POST `/backend-api/sentinel/chat-requirements`，body `{"p": ""}`
    → 返回 `{token, proofofwork: {required, seed, difficulty}}`
+   > **`p` 必须传空串**。这个字段原本是「首包 PoW 证明」（`gAAAAAC` + 长 base64），
+   > 但 2026-10 起服务端对长 `p` 一律回 `HTTP 500 {"detail":"Internal Server Error"}`，
+   > 空 `p` 反而正常返回凭证。真正需要的 PoW 走下一步的 `proofofwork` 挑战。
 3. **PoW 求解**（`solve_pow`）：
-   - 构造 JSON 配置（含 `seed`、`difficulty`、`nonce`），base64 编码；
+   - 构造 **18 元素** JSON 数组并 base64 编码，前缀 `gAAAAAB` 即 proof token；
    - 计算 `SHA3-512(seed_bytes ‖ base64_bytes)`；
    - 要求摘要前 N 字节 ≤ `difficulty`（十六进制解码后逐字节比较）；
    - 命中即返回该 base64 串作为 proof。
+   - **数组排布（踩过两次坑，改错就 500 或 403）**：
+     `[3000, time, 4294705152, i, i>>1, UA, script, dpl, "en-US", "en-US,es-US,en,es",
+       nav, "__NEXT_DATA__", "__next_set_public_path__", perf, uuid, "", 8, timediff]`
+     - `i` 在 **index 3**，`i>>1` 紧跟其后的 **index 4**（实测放 index 9 会 403）；
+     - 整段 JSON **必须以 `]` 结尾**，漏了就是 `HTTP 500 "Hmm...something seems to have gone wrong."`；
+     - 回归测试 `pow_payload_is_valid_json` 守这两点。
    - 实现细节：零分配内循环 + 手写 u64 → ASCII 转换（`push_u64`），
-     **release 下 `000032` 难度约 1.02 秒**；debug 下约 129 秒（正常，勿用 debug 测）。
+     **release 下 `000032` 难度约 1 秒**；debug 下极慢（正常，勿用 debug 测）。
+   - **一个 token 只能用一次**：chat-requirements 的 `token` 与 proof 是一次性的，
+     复用会 403 `Unusual activity has been detected`。每次对话都要重新申请。
 4. **发消息**：POST `/backend-api/conversation`，头包括：
    - `Authorization: Bearer {accessToken}`
    - `openai-sentinel-chat-requirements-token: {token}`
@@ -288,11 +300,20 @@ backend-api 要求**显式声明用哪个账号**，否则 sentinel 接口会抛
    body `{"name":"", "model": "..."}` → 返回 `uuid`
 3. **对话**：POST `/api/organizations/{org}/chat_conversations/{uuid}/completion`
    body 含 `prompt`、`timezone`、`personalized_styles`、`tools`
-4. **流式**：SSE 事件 `content_block_delta` → `delta.text`；`message_stop` 结束
-5. **多轮**：`meta` 保存 `claude_conv_uuid` 与 `parent_uuid`，续写时带 `parent_message_uuid`
-6. **限流**：429 时读 `anthropic-ratelimit-requests-reset` 头
+   > 不要塞任何自定义字段。加过 `turn_message_uuid`，服务端直接回
+   > `400 invalid_request_error: "turn_message_uuid: Extra inputs are not permitted"`。
+4. **模型名用别名**：`claude-sonnet-4-5` / `claude-opus-4-1` / `claude-3-7-sonnet-latest`。
+   带日期后缀的老名字（如 `claude-sonnet-4-5-20250929`）会回
+   `permission_error: model_not_available`，看起来像账号没权限，其实是名字不对。
+5. **流式**：SSE 事件 `content_block_delta` → `delta.text`；`message_stop` 结束
+6. **多轮**：`meta` 保存 `claude_conv_uuid` 与 `parent_uuid`，续写时带 `parent_message_uuid`
+7. **限流**：429 时读 `anthropic-ratelimit-requests-reset` 头
 
 请求头含 `anthropic-client-version`（常量 `2025-04-01`）与桌面 UA。
+
+> **真机现状（2026-10-24）**：协议层已跑通（不再有 400 / model_not_available），
+> 但测试账号的网页版额度被限流，`completion` 稳定回 **429**。
+> 这是账号层面的额度问题，不是代码问题——换一个未限流的账号即可。
 
 > ⚠️ 上述两个网页协议的接口细节来自开源项目 `lanqian528/chat2api` 与 `caiwuu/web2api` 的源码分析。
 > 官方随时可能变更，失效时请以最新源码为准。
@@ -448,7 +469,11 @@ ai-hub-web.exe --web-dir ./web # 从磁盘读前端，改完刷新即可生效�
 
 ### 环境变量
 
-`AI_HUB_NO_OPEN=1` 可阻止自动打开浏览器（CI / 调试用）。
+| 变量 | 作用 |
+|---|---|
+| `AI_HUB_NO_OPEN=1` | 阻止自动打开浏览器（CI / 调试用） |
+| `AI_HUB_PORT=9000` | 指定端口（等价 `--port`） |
+| `AI_HUB_DEBUG_POW=1` | 打开网页版对话失败时的详细日志：把 seed/proof 写到 `%TEMP%\ai-hub-proof.txt`，并把服务端原始响应打到 stderr |
 
 ---
 
@@ -458,23 +483,27 @@ ai-hub-web.exe --web-dir ./web # 从磁盘读前端，改完刷新即可生效�
 
 | 类型 | 做法 |
 |---|---|
-| 单元测试 | `cargo test --release pow_solves` 验证 PoW 正确性与耗时 |
+| 单元测试 | `cargo test`（9 项）：PKCE RFC 向量、JWT claim 解析、PoW 求解与**载荷 JSON 合法性**、设备 ID 稳定性、base_url 归一化 |
 | 协议级 mock | Python 起 mock 服务，严格复刻 ChatGPT sentinel+PoW、Claude SSE、Gemini 原生 SSE |
-| API 级 | Python 脚本走 REST + SSE，校验逐字增量与事件序列 |
+| API 级 | Python/Node 脚本走 REST + SSE，校验逐字增量与事件序列 |
+| **真机在线验证** | `verify-live.cjs <provider>`、`verify-chatgpt-live.cjs`、`verify-chatgpt-multi.cjs` |
 | UI 级 | Playwright 真实 Chromium，检查 DOM、弹窗、零 JS 错误、截图 |
 
-### 关键验证结论
+### 关键验证结论（2026-10-24 更新）
 
-- ChatGPT PoW（`000032`）：release **1.02s**，debug 129s
-- 两网页协议多轮：第二轮正确携带会话/父消息 ID
-- 真实 HTTPS：指向 Google 返回标准 `API key not valid`，证明 rustls TLS 正常
-- 浏览器端：四个服务按钮文案与弹窗路由正确，零 JS 错误
+- `cargo test` **9/9 通过**
+- **ChatGPT 真机**：单轮 `只回复两个字：收到` ✅；多轮记忆（7391）✅
+- **Gemini 真机**：`gemini-2.5-flash` ✅
+- **Claude 真机**：协议通过，账号 429 限流 ⚠️
+- 通用 OpenAI 兼容：6 项端到端全过（404 回退 / 思考过程 / 可读错误 / 拉取模型）
+- 退出逻辑：无页面 9s 退、页面开着不误杀、页面离开 11.5s 退
 
 ### 复现测试的建议顺序
 
-1. `cargo test --release pow_solves` —— 先确认 PoW 没坏
-2. 起 mock → 改 `base_url` 指向 mock → 走完整 chat
-3. Playwright 跑 UI 回归（注意用 `domcontentloaded`，**不要用 `networkidle`**，
+1. `cargo test` —— 先确认 PoW 与解析没坏
+2. 起服务后 `node verify-live.cjs chatgpt` —— 真机冒烟
+3. 起 mock → 改 `base_url` 指向 mock → 走完整 chat（`verify-openai.cjs`）
+4. Playwright 跑 UI 回归（注意用 `domcontentloaded`，**不要用 `networkidle`**，
    因为 SSE 长连接会让网络永不空闲）
 
 ---
@@ -491,10 +520,16 @@ Gemini 可切「官方原生 ⇄ OpenAI 兼容层」，切换时联动字段标�
 `renderAccounts()` 现按 `ptype` 只显示一个按钮：网页版端点只显示「网页登录抓 Token」，
 Key 类端点只显示「＋ 手动填 Key」。
 
-### 3. 网页版协议无真实账号验证
+### 3. ~~网页版协议无真实账号验证~~ —— 已解决（2026-10-24）
 
-仅通过 mock 验证。若真机失效，排查顺序：
-dpl 提取 → sentinel 接口字段 → PoW 难度算法 → conversation 请求体字段。
+ChatGPT 用真实 OAuth 账号跑通了单轮与多轮。过程中修掉三个真机才暴露的问题：
+`chatgpt-account-id` 缺失导致 sentinel 500、JWT claim key 含 `/` 解析不出账号 ID、
+PoW 载荷 JSON 缺结尾 `]` 且 `i>>1` 位置错（详见 6.3 与 6.3.2）。
+
+真机再失效时的排查顺序：
+`chatgpt-account-id` → sentinel 返回体 → PoW 载荷是否合法 JSON → conversation 请求体字段。
+
+Claude 侧：协议层已通（不再 400 / model_not_available），当前卡在账号 429 限流。
 
 ### 4. ~~流式取消未实现~~ —— 已实现
 

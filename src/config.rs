@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,12 +126,14 @@ fn default_config() -> AppConfig {
                 base_url: "https://claude.ai/api".into(),
                 api_key: "".into(),
                 login_url: Some("https://claude.ai".into()),
+                // 网页版只认不带日期后缀的别名；带日期的老名字会回
+                // model_not_available（不是账号问题，是名字不对）。
                 models: vec![
-                    "claude-sonnet-4-5-20250929".into(),
-                    "claude-3-7-sonnet-20250219".into(),
-                    "claude-3-5-sonnet-20241022".into(),
+                    "claude-sonnet-4-5".into(),
+                    "claude-opus-4-1".into(),
+                    "claude-3-7-sonnet-latest".into(),
                 ],
-                default_model: "claude-sonnet-4-5-20250929".into(),
+                default_model: "claude-sonnet-4-5".into(),
                 proxy: None,
                 enabled: true,
                 preferred_account: None,
@@ -331,4 +334,55 @@ pub fn update_account(
             }
         }
     });
+}
+
+/// 启动时修补：早期版本的 OAuth 登录只解析 id_token，导致账号 meta 里
+/// 没有 `chatgpt_account_id`；缺它会让 backend-api 的 sentinel 接口 500。
+/// 这里从 access_token 的 JWT claim 里把它补回去，用户不必重新登录。
+pub fn backfill_chatgpt_meta(dir: &Path) -> Result<(), String> {
+    let mut cfg = load_config(dir)?;
+    let mut changed = false;
+    for p in cfg.providers.iter_mut() {
+        if p.ptype != "chatgpt_web" {
+            continue;
+        }
+        for a in p.accounts.iter_mut() {
+            let mut meta = match a.meta.clone() {
+                Some(Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            };
+            let has_id = meta
+                .get("chatgpt_account_id")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if has_id {
+                continue;
+            }
+            let Some(c) = crate::oauth::parse_jwt_claims(&a.secret) else {
+                continue;
+            };
+            let mut dirty = false;
+            if let Some(id) = c.chatgpt_account_id {
+                meta.insert("chatgpt_account_id".into(), Value::String(id));
+                dirty = true;
+            }
+            if let Some(pt) = c.chatgpt_plan_type {
+                meta.insert("plan_type".into(), Value::String(pt));
+                dirty = true;
+            }
+            if let Some(em) = c.email {
+                meta.insert("email".into(), Value::String(em));
+                dirty = true;
+            }
+            if dirty {
+                a.meta = Some(Value::Object(meta));
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        save_config(dir, &cfg)?;
+    }
+    Ok(())
 }

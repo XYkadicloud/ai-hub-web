@@ -108,6 +108,10 @@ async fn run() {
     if let Err(e) = config::ensure_config(&dir) {
         log(&dir, &format!("初始化配置失败: {}", e));
     }
+    // 修补老版本 OAuth 账号缺失的 chatgpt_account_id（否则网页版接口会 500）
+    if let Err(e) = config::backfill_chatgpt_meta(&dir) {
+        log(&dir, &format!("修补账号信息失败: {}", e));
+    }
 
     // 可选：--web-dir <目录> 从磁盘加载前端（改 UI 无需重新编译）
     let web_dir = parse_web_dir();

@@ -481,11 +481,13 @@ async fn chatgpt_send(
     }
 
     // 1) 申请聊天凭证 + PoW 挑战
-    let p = requirements_token(DEFAULT_DPL);
+    // 实测（2026-10）：这个接口对「长 p 载荷」会直接 500，而首次申请凭证
+    // 本来就不需要有效 PoW —— 传空 p 一样能拿到 token。真正需要 PoW 时，
+    // 服务端会在响应里给 proofofwork 挑战，下面再解，所以这里不再预生成。
     let resp = client
         .post(format!("{}/backend-api/sentinel/chat-requirements", host))
         .headers(headers.clone())
-        .json(&json!({ "p": p }))
+        .json(&json!({ "p": "" }))
         .send()
         .await
         .map_err(|e| format!("连接 ChatGPT 失败: {}", e))?;
@@ -535,6 +537,7 @@ async fn chatgpt_send(
         .ok_or_else(|| "未返回 chat token（账号可能失效或需人机验证）".to_string())?
         .to_string();
 
+    let mut pow_seed_debug = String::new();
     let proof = if j
         .pointer("/proofofwork/required")
         .and_then(|v| v.as_bool())
@@ -548,6 +551,7 @@ async fn chatgpt_send(
             .pointer("/proofofwork/difficulty")
             .and_then(|v| v.as_str())
             .unwrap_or("000032");
+        pow_seed_debug = seed.to_string();
         if seed.is_empty() {
             None
         } else {
@@ -602,11 +606,17 @@ async fn chatgpt_send(
         HeaderName::from_bytes(b"openai-sentinel-chat-requirements-token").map_err(|e| e.to_string())?,
         hv(&chat_token)?,
     );
-    if let Some(pf) = proof {
+    if let Some(pf) = &proof {
         ch.insert(
             HeaderName::from_bytes(b"openai-sentinel-proof-token").map_err(|e| e.to_string())?,
-            hv(&pf)?,
+            hv(pf)?,
         );
+        if std::env::var("AI_HUB_DEBUG_POW").is_ok() {
+            let _ = std::fs::write(
+                std::env::temp_dir().join("ai-hub-proof.txt"),
+                format!("seed={}\nproof={}", pow_seed_debug, pf),
+            );
+        }
     }
 
     let resp = client
@@ -617,6 +627,20 @@ async fn chatgpt_send(
         .await
         .map_err(|e| format!("发送对话失败: {}", e))?;
     if !resp.status().is_success() {
+        if std::env::var("AI_HUB_DEBUG_POW").is_ok() {
+            let st = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!(
+                "[pow-debug] conv={} proof_len={} chat_token_len={} model={} -> {} {}",
+                st,
+                proof.as_deref().map(|s| s.len()).unwrap_or(0),
+                chat_token.len(),
+                model,
+                st,
+                &body[..body.len().min(300)]
+            );
+            return Err(format!("ChatGPT conversation HTTP {}: {}", st, body));
+        }
         return Err(http_err("ChatGPT conversation", resp).await);
     }
 
@@ -866,8 +890,8 @@ async fn claude_send(
     if let Some(p) = meta.claude_parent_uuid.clone() {
         body["parent_message_uuid"] = json!(p);
     }
-    // 新版网页端每轮都会带一个 turn_message_uuid，缺了容易被判为异常客户端
-    body["turn_message_uuid"] = json!(oauth::uuid_v4());
+    // 注意：不要再塞 `turn_message_uuid` 之类的自定义字段——Claude 会直接回
+    // 400 invalid_request_error: "turn_message_uuid: Extra inputs are not permitted"。
 
     // Referer 必须指向具体会话，风控会校验来源页面
     let mut send_headers = headers.clone();
@@ -997,8 +1021,10 @@ fn solve_pow(seed: &str, diff_hex: &str, dpl: &str) -> String {
         buf.clear();
         buf.extend_from_slice(&p1);
         push_u64(&mut buf, i);
-        buf.extend_from_slice(&p2);
+        buf.push(b',');
         push_u64(&mut buf, i >> 1);
+        buf.push(b',');
+        buf.extend_from_slice(&p2);
         buf.extend_from_slice(&p3);
 
         let n = match B64.encode_slice(&buf, &mut b64out) {
@@ -1064,6 +1090,10 @@ fn device_id_for(seed: &str) -> String {
     )
 }
 
+/// 生成 sentinel 的 `p` 载荷（长 PoW 证明）。
+/// 注意：chat-requirements 目前对长载荷会返回 500，故首次申请不再使用它；
+/// 保留实现供 `proofofwork` 阶段与后续格式变化复用。
+#[allow(dead_code)]
 fn requirements_token(dpl: &str) -> String {
     let seed = format!("0.{}", now_millis().unsigned_abs() % 1_000_000_000);
     format!("gAAAAAC{}", solve_pow(&seed, "0fffff", dpl))
@@ -1091,18 +1121,20 @@ fn build_pow_config(dpl: &str) -> (String, String, String) {
 
     // config[0..3] -> "[res,time,4294705152,"
     let part1 = format!("[{},{},4294705152,", 3000u32, json_str(&time_str));
-    // config[4..9] -> ",ua,script,dpl,\"en-US\",\"en-US,es-US,en,es\","
+    // config[5..9] -> "ua,script,dpl,\"en-US\",\"en-US,es-US,en,es\","
+    // （config[3]=i 与 config[4]=i>>1 由 solve_pow 插在 part1 与 part2 之间）
     let part2 = format!(
-        ",{},{},{},{},{},",
+        "{},{},{},{},{},",
         json_str(CHATGPT_UA),
         json_str(&script),
         json_str(dpl),
         json_str("en-US"),
         json_str("en-US,es-US,en,es")
     );
-    // config[10..] -> ",nav,doc,win,perf,uuid,\"\",cores,timediff"
+    // config[10..] -> "nav,doc,win,perf,uuid,\"\",cores,timediff]"
+    // 注意结尾的 `]`：漏掉会让整段 JSON 不合法，服务端直接回 500。
     let part3 = format!(
-        ",{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{}]",
         json_str(nav),
         json_str(doc),
         json_str(win),
@@ -1288,7 +1320,10 @@ async fn http_err(stage: &str, resp: reqwest::Response) -> String {
                 format!("{} 被风控拦截或无权限：{}", stage, short)
             }
         }
-        429 => format!("{} 触发限流或额度用尽", stage),
+        429 => format!(
+            "{} 触发限流或额度用尽（网页版免费额度耗尽也会这样，换账号或稍后再试）",
+            stage
+        ),
         _ => format!("{} HTTP {}: {}", stage, code, short),
     }
 }
@@ -1325,5 +1360,23 @@ mod tests {
             println!("diff={} ok={} elapsed={:?}", diff, ok, elapsed);
             assert!(ok, "diff {} 未求解成功", diff);
         }
+    }
+
+    /// 回归测试：PoW 载荷必须是合法 JSON（曾经漏了结尾 `]`，
+    /// 服务端解析失败后一律回 500 "Hmm...something seems to have gone wrong."）。
+    #[test]
+    fn pow_payload_is_valid_json() {
+        let b64 = solve_pow("0.5", "000032", DEFAULT_DPL);
+        let raw = B64.decode(b64.as_bytes()).expect("proof 不是合法 base64");
+        let v: Value = serde_json::from_slice(&raw).expect("PoW 载荷不是合法 JSON");
+        let arr = v.as_array().expect("PoW 载荷应为数组");
+        assert_eq!(arr.len(), 18, "PoW config 应为 18 个元素");
+        assert!(arr[3].is_u64(), "config[3] 应是自增计数 i");
+        assert!(arr[4].is_u64(), "config[4] 应是 i>>1");
+        assert!(arr[5].as_str().unwrap_or("").contains("Mozilla"), "config[5] 应是 UA");
+        assert!(
+            arr[10].as_str().unwrap_or("").contains("registerProtocolHandler"),
+            "config[10] 应是 nav 指纹"
+        );
     }
 }

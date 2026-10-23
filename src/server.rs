@@ -675,11 +675,30 @@ async fn oauth_start(
 
 /// 把 token 三件套落进账号池（callback / finish 共用）。
 async fn persist_oauth_account(s: &AppState, tokens: oauth::TokenSet) -> Result<Account, AppErr> {
-    let claims = tokens
-        .id_token
-        .as_deref()
-        .and_then(oauth::parse_jwt_claims)
-        .or_else(|| oauth::parse_jwt_claims(&tokens.access_token));
+    // 账号 ID / 套餐 这些 claim 有时在 id_token、有时只在 access_token 里，
+    // 两边都解析再合并——只取 id_token 会漏掉 chatgpt_account_id，
+    // 而它缺失会让 backend-api 的 sentinel 接口直接 500。
+    let mut merged = oauth::IdClaims::default();
+    for c in [
+        tokens.id_token.as_deref().and_then(oauth::parse_jwt_claims),
+        oauth::parse_jwt_claims(&tokens.access_token),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if merged.email.is_none() {
+            merged.email = c.email;
+        }
+        if merged.chatgpt_account_id.is_none() {
+            merged.chatgpt_account_id = c.chatgpt_account_id;
+        }
+        if merged.chatgpt_plan_type.is_none() {
+            merged.chatgpt_plan_type = c.chatgpt_plan_type;
+        }
+    }
+    let has_claims =
+        merged.email.is_some() || merged.chatgpt_account_id.is_some();
+    let claims = if has_claims { Some(merged) } else { None };
     let mut meta = serde_json::Map::new();
     if let Some(rt) = &tokens.refresh_token {
         meta.insert("refresh_token".into(), json!(rt));

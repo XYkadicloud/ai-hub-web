@@ -204,7 +204,7 @@ async fn run(
         });
     }
 
-    Err("所有账号均不可用".into())
+    Err(format!("{} 个账号均不可用，请检查 Key / 余额 / 网络", total))
 }
 
 /// 生图分支：POST {base}/images/generations，base64 落盘后以 Markdown 图片推回聊天流。

@@ -334,9 +334,16 @@ pub fn parse_jwt_claims(jwt: &str) -> Option<IdClaims> {
     let payload = jwt.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let v: Value = serde_json::from_slice(&bytes).ok()?;
-    let auth = v.pointer("/https://api.openai.com/auth");
+    // 注意：这个 claim 的 key 本身带 `/`，不能用 `pointer("/https://...")`
+    // （JSON Pointer 会把 `/` 当路径分隔符），必须按普通 key 取。
+    let auth = v.get("https://api.openai.com/auth");
+    let profile = v.get("https://api.openai.com/profile");
     Some(IdClaims {
-        email: v.get("email").and_then(|x| x.as_str()).map(String::from),
+        email: v
+            .get("email")
+            .and_then(|x| x.as_str())
+            .or_else(|| profile.and_then(|p| p.get("email")).and_then(|x| x.as_str()))
+            .map(String::from),
         chatgpt_account_id: auth
             .and_then(|a| a.get("chatgpt_account_id"))
             .and_then(|x| x.as_str())
@@ -435,6 +442,28 @@ mod tests {
         let mut h = Sha256::new();
         h.update(v.as_bytes());
         assert_eq!(c, URL_SAFE_NO_PAD.encode(h.finalize()));
+    }
+
+    /// 回归测试：claim key 本身带 `/`，用 JSON Pointer 取会失败，
+    /// 导致 chatgpt_account_id 一直解析不出来（进而让网页版接口 500）。
+    #[test]
+    fn parses_auth_claim_with_slashes_in_key() {
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "9ed68710-7a88-4512-a2d1-e85fe9867428",
+                "chatgpt_plan_type": "free"
+            },
+            "https://api.openai.com/profile": { "email": "a@b.com" }
+        });
+        let enc = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let jwt = format!("x.{}.y", enc);
+        let c = parse_jwt_claims(&jwt).unwrap();
+        assert_eq!(
+            c.chatgpt_account_id.as_deref(),
+            Some("9ed68710-7a88-4512-a2d1-e85fe9867428")
+        );
+        assert_eq!(c.chatgpt_plan_type.as_deref(), Some("free"));
+        assert_eq!(c.email.as_deref(), Some("a@b.com"));
     }
 
     #[test]
