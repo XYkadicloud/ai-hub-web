@@ -256,6 +256,27 @@ Auth0 给 Codex 这个公开客户端注册了 **loopback 回调**（任意 loca
 | 不知道模型名该填什么 | 设置页每个端点有「拉取模型」按钮 → `POST /api/models` → `GET {base}/models`（同样带 /v1 回退），自动填进模型列表 |
 | 推理模型不接受 `temperature` | 请求体不再硬塞 `temperature`，交给服务端默认值 |
 
+### 6.3.2 `chatgpt_web` —— ChatGPT 网页版（含 OAuth 账号）
+
+请求头是关键。OAuth（Codex 客户端）签发的 access_token 带组织信息，
+backend-api 要求**显式声明用哪个账号**，否则 sentinel 接口会抛
+`HTTP 500 {"detail":"Internal Server Error"}`（FastAPI 里取 header 失败）。
+
+必备头：
+
+| 头 | 值 | 说明 |
+| --- | --- | --- |
+| `Authorization` | `Bearer <access_token>` | |
+| `chatgpt-account-id` | 账号 meta 里的 `chatgpt_account_id` | **缺了就是 500**；没有 meta 时从 token 的 `https://api.openai.com/auth` claim 里读 |
+| `oai-device-id` | 由账号 ID 派生的稳定 UUID | 每次随机会被当成换设备 |
+| `oai-language` / `Origin` / `Referer` | `en-US` / `https://chatgpt.com` / `https://chatgpt.com/` | |
+| `sec-ch-ua` / `sec-fetch-*` | 见 `chatgpt_headers()` | 伪装成浏览器 |
+
+**兜底**：sentinel 返回 500/401/403 时，自动改走 Codex 官方接口
+`POST /backend-api/codex/responses`（Responses API 格式，SSE 事件名
+`response.output_text.delta`）。这才是 OAuth token 的原生用法，
+如果当前模型名不被接受（网页版模型和 Codex 模型不是一套），会自动换 `gpt-5` 再试一次。
+
 ### 6.4 `claude_web` —— Claude 网页版
 
 账号字段：`secret` = **sessionKey**（Cookie 值，HttpOnly，JS 读不到，需手动复制）。

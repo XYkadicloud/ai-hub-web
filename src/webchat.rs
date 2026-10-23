@@ -189,12 +189,19 @@ async fn run_web(
 
         let res = match provider.ptype.as_str() {
             "chatgpt_web" => {
+                let account_id = acc
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("chatgpt_account_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 chatgpt_send(
                     &client,
                     dir,
                     &provider.base_url,
                     &sec,
                     acc.cookie.as_deref(),
+                    account_id.as_deref(),
                     model,
                     messages,
                     attempt,
@@ -257,12 +264,160 @@ fn save_meta(dir: &Path, conv_id: &str, m: &WebMeta) {
 
 // ============================ ChatGPT 网页版 ============================
 
+/// Codex 官方接口（`/backend-api/codex/responses`）兜底。
+///
+/// OAuth（Codex 客户端）签发的 access_token 天生就是给这个接口用的，
+/// 走网页版协议偶尔会被 sentinel 拒；这里用 Responses API 的格式再试一次。
+/// 只有确实拿到文本增量才算成功，否则返回 Err 让调用方继续报原错误。
+#[allow(clippy::too_many_arguments)]
+async fn chatgpt_codex_send(
+    client: &Client,
+    host: &str,
+    token: &str,
+    account_id: &str,
+    model: &str,
+    dir: &Path,
+    messages: &[ChatMessage],
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+    abort: &Option<AbortFlag>,
+) -> Result<(), String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, hv(&format!("Bearer {}", token))?);
+    headers.insert(CONTENT_TYPE, hv("application/json")?);
+    headers.insert(USER_AGENT, hv(CHATGPT_UA)?);
+    headers.insert(ACCEPT, hv("text/event-stream")?);
+    headers.insert(ORIGIN, hv("https://chatgpt.com")?);
+    headers.insert(REFERER, hv("https://chatgpt.com/")?);
+    headers.insert(ACCEPT_LANGUAGE, hv("en-US,en;q=0.9")?);
+    for (k, v) in [
+        ("chatgpt-account-id", account_id),
+        ("OpenAI-Beta", "responses=experimental"),
+        ("originator", "codex_cli_rs"),
+        ("oai-language", "en-US"),
+    ] {
+        if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), hv(v)) {
+            headers.insert(name, val);
+        }
+    }
+    let device = device_id_for(account_id);
+    if let (Ok(name), Ok(val)) = (
+        HeaderName::from_bytes(b"session_id"),
+        hv(device.as_str()),
+    ) {
+        headers.insert(name, val);
+    }
+
+    let input: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            json!({
+                "type": "message",
+                "role": m.role,
+                "content": [{
+                    "type": if m.role == "assistant" { "output_text" } else { "input_text" },
+                    "text": build_web_text(dir, m),
+                }]
+            })
+        })
+        .collect();
+    let body = json!({
+        "model": model,
+        "instructions": "You are ChatGPT, a helpful assistant.",
+        "input": input,
+        "stream": true,
+        "store": false,
+        "parallel_tool_calls": false,
+    });
+
+    let resp = client
+        .post(format!("{}/backend-api/codex/responses", host))
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("连接 Codex 接口失败: {}", e))?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Codex 接口 HTTP {}: {}",
+            code,
+            text.chars().take(160).collect::<String>()
+        ));
+    }
+
+    let mut buf = String::new();
+    let mut got = false;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        if is_aborted(abort) {
+            return if got { Ok(()) } else { Err("已停止".into()) };
+        }
+        let chunk = chunk.map_err(|e| format!("读取响应流失败: {}", e))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk).replace("\r\n", "\n"));
+        while let Some(idx) = buf.find("\n\n") {
+            let ev = buf[..idx].to_string();
+            buf = buf[idx + 2..].to_string();
+            if codex_event(&ev, tx) {
+                got = true;
+            }
+        }
+    }
+    if !buf.trim().is_empty() && codex_event(&buf, tx) {
+        got = true;
+    }
+    if got {
+        Ok(())
+    } else {
+        Err("Codex 接口未返回文本".into())
+    }
+}
+
+/// 解析 Responses API 的 SSE 事件，只关心文本增量。
+fn codex_event(ev: &str, tx: &mpsc::UnboundedSender<ChatEvent>) -> bool {
+    let mut got = false;
+    for line in ev.lines() {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match ty {
+            "response.output_text.delta" => {
+                if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                    if !d.is_empty() {
+                        let _ = tx.send(ChatEvent::Delta(d.to_string()));
+                        got = true;
+                    }
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                    if !d.is_empty() {
+                        let _ = tx.send(ChatEvent::Reasoning(d.to_string()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    got
+}
+
 async fn chatgpt_send(
     client: &Client,
     dir: &Path,
     base_url: &str,
     token: &str,
     cookie: Option<&str>,
+    account_id: Option<&str>,
     model: &str,
     messages: &[ChatMessage],
     mut meta: WebMeta,
@@ -276,11 +431,49 @@ async fn chatgpt_send(
         host
     };
 
+    // OAuth 拿到的 access_token 带组织信息，backend-api 要求显式声明用哪个
+    // 账号，否则 sentinel 接口会直接 500（FastAPI 里取不到 header 抛异常）。
+    // 优先用账号 meta 里存的，其次从 JWT 的 auth claim 里读。
+    let account_id = account_id
+        .map(|s| s.to_string())
+        .or_else(|| {
+            oauth::parse_jwt_claims(token)
+                .and_then(|c| c.chatgpt_account_id)
+        })
+        .filter(|s| !s.trim().is_empty());
+
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, hv(&format!("Bearer {}", token))?);
     headers.insert(CONTENT_TYPE, hv("application/json")?);
     headers.insert(USER_AGENT, hv(CHATGPT_UA)?);
     headers.insert(ACCEPT, hv("*/*")?);
+    // 补齐网页端会带的头，缺了容易被 sentinel 判定为异常客户端
+    headers.insert(ORIGIN, hv("https://chatgpt.com")?);
+    headers.insert(REFERER, hv("https://chatgpt.com/")?);
+    headers.insert(ACCEPT_LANGUAGE, hv("en-US,en;q=0.9")?);
+    let device_id = device_id_for(account_id.as_deref().unwrap_or(token));
+    for (k, v) in [
+        ("oai-device-id", device_id.as_str()),
+        ("oai-language", "en-US"),
+        ("sec-ch-ua", "\"Chromium\";v=\"142\", \"Not:A-Brand\";v=\"24\""),
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-platform", "\"Windows\""),
+        ("sec-fetch-dest", "empty"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-site", "same-origin"),
+    ] {
+        if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), hv(v)) {
+            headers.insert(name, val);
+        }
+    }
+    if let Some(aid) = &account_id {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(b"chatgpt-account-id"),
+            hv(aid.as_str()),
+        ) {
+            headers.insert(name, val);
+        }
+    }
     if let Some(c) = cookie {
         if !c.trim().is_empty() {
             headers.insert(COOKIE, hv(c)?);
@@ -297,7 +490,40 @@ async fn chatgpt_send(
         .await
         .map_err(|e| format!("连接 ChatGPT 失败: {}", e))?;
     if !resp.status().is_success() {
-        return Err(http_err("ChatGPT chat-requirements", resp).await);
+        let code = resp.status().as_u16();
+        let e = http_err("ChatGPT chat-requirements", resp).await;
+        // OAuth 拿到的 token 在网页版协议里偶尔会被拒（sentinel 500/401）。
+        // 这类 token 的「原生」用法是 Codex 的 responses 接口，试一次兜底。
+        if code == 500 || code == 401 || code == 403 {
+            if let Some(aid) = &account_id {
+                let first = chatgpt_codex_send(
+                    client, host, token, aid, model, dir, messages, tx, abort,
+                )
+                .await;
+                let ok = match first {
+                    Ok(()) => true,
+                    // 端点不认识这个模型名（网页版模型和 Codex 模型不是一套），
+                    // 换 gpt-5 再试一次；只有「请求没被接受」时才重试，避免重复输出
+                    Err(e) if e.contains("HTTP 4") && model != "gpt-5" => {
+                        chatgpt_codex_send(
+                            client, host, token, aid, "gpt-5", dir, messages, tx, abort,
+                        )
+                        .await
+                        .is_ok()
+                    }
+                    Err(_) => false,
+                };
+                if ok {
+                    return Ok(meta);
+                }
+            }
+        }
+        let hint = if code == 500 && account_id.is_none() {
+            "（没取到账号 ID：OAuth token 里没有组织信息，请重新登录该账号）"
+        } else {
+            ""
+        };
+        return Err(format!("{}{}", e, hint));
     }
     let j: Value = resp
         .json()
@@ -815,6 +1041,29 @@ fn push_u64(buf: &mut Vec<u8>, mut n: u64) {
 }
 
 /// chat-requirements 首包所需的 `p` 参数（低难度占位证明）。
+/// 由账号标识派生一个稳定的设备 ID（UUID 形状）。
+/// sentinel 会把它当设备指纹，同一账号必须保持不变，所以不能每次随机。
+fn device_id_for(seed: &str) -> String {
+    // FNV-1a 64 位，两轮不同盐，凑出 32 个十六进制字符
+    let mut out = [0u8; 16];
+    for (i, salt) in [0x9e37u64, 0x85ebu64].iter().enumerate() {
+        let mut h: u64 = 0xcbf29ce484222325 ^ salt;
+        for b in seed.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        out[i * 8..i * 8 + 8].copy_from_slice(&h.to_be_bytes());
+    }
+    out[6] = (out[6] & 0x0f) | 0x40;
+    out[8] = (out[8] & 0x3f) | 0x80;
+    let h: Vec<String> = out.iter().map(|b| format!("{:02x}", b)).collect();
+    format!(
+        "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
+        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13],
+        h[14], h[15]
+    )
+}
+
 fn requirements_token(dpl: &str) -> String {
     let seed = format!("0.{}", now_millis().unsigned_abs() % 1_000_000_000);
     format!("gAAAAAC{}", solve_pow(&seed, "0fffff", dpl))
@@ -1047,6 +1296,18 @@ async fn http_err(stage: &str, resp: reqwest::Response) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_id_is_stable_and_uuid_shaped() {
+        let a = device_id_for("acc-123");
+        let b = device_id_for("acc-123");
+        let c = device_id_for("acc-456");
+        assert_eq!(a, b, "同一账号必须稳定，否则 sentinel 会认为换设备");
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 36);
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+    }
 
     #[test]
     fn pow_solves_and_verifies() {
