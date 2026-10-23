@@ -37,16 +37,24 @@
 | 流式输出（SSE） | ✅ | 逐字增量推送 |
 | 浏览器 UI（设置、账号池、抓取弹窗、Key 表单） | ✅ | Playwright 真实浏览器，零 JS 错误 |
 | Windows 交叉编译 | ✅ | `x86_64-pc-windows-gnu`，仅依赖系统 DLL |
+| **生图**（🎨 开关 + 模型名自动识别） | ✅ 代码完成 | `/images/generations` → base64 落盘 → SSE 推 Markdown 图片 |
+| **文件上传**（📎 + 拖拽，图片/文本/文件） | ✅ 代码完成 | 原始字节 POST `/api/upload`；图片走多模态，文本内联 |
+| **ChatGPT OAuth 登录**（PKCE + refresh 自动续期） | ✅ 代码完成 | 授权码流程按 `chatgpt2api` 同规格实现；真机待验证 |
+| **书签脚本零粘贴抓取** | ✅ 代码完成 | 页面上下文取 accessToken → CORS POST 回本地服务 → SSE 自动收尾 |
+| **流式取消** | ✅ | `POST /api/chat/stop` + 各协议流式循环检查 |
+| **接入方式切换 UI** | ✅ | 每张服务卡下拉切换 网页版 / OpenAI 兼容 / Gemini 原生 |
+| **固定端口 25880**（可 `--port` 覆盖，占用回退随机） | ✅ | 书签脚本/OAuth 依赖端口稳定 |
 
 ### 明确未做 / 有局限
 
 | 项 | 说明 |
 |---|---|
 | **ChatGPT / Claude 真实账号实测** | 开发环境无登录态，只用「严格复刻官方协议的 mock」验证。真机上若失效，大概率是官方改了接口，不是代码逻辑错 |
+| **OAuth 真机登录** | 按 `yukkcat/chatgpt2api` 的公开流程实现（authorize/code 兑换/refresh），首次真机使用若报错，优先核对 `state` 与回调 URL 完整性 |
 | **Gemini 国内直连** | `generativelanguage.googleapis.com` 国内需代理，无代理不可用 |
 | **ChatGPT / Claude 网页版** | 同样需要能访问对应站点（需代理） |
-| **接入方式切换 UI** | 见「已知问题 1」，这是当前最需要补的一块 |
-| **流式取消** | 前端有停止按钮的 DOM，但后端未实现中断信号（详见已知问题 4） |
+| **语音识别** | 产品决策：不做（浏览器原生/后端 whisper 均不实现） |
+| **Gemini 原生生图** | 生图分支只走 OpenAI 兼容 `/images/generations`；Gemini 图片模型（imagen 等）未接 |
 | **安装包** | 目前只产出裸 exe，无安装器、无开机自启、无托盘 |
 
 ---
@@ -76,21 +84,25 @@ ai-hub-web/
 ├── build.rs                  # 注入构建时间 BUILD_TS，供界面显示版本
 ├── README.md                 # 用户向说明
 ├── HANDOVER.md               # 本文档（开发向）
+├── .github/workflows/build.yml  # CI：test + Windows/Linux 双平台 release 构建
 ├── src/
-│   ├── main.rs       (110)   # 入口：数据目录、随机端口、开浏览器、优雅退出、--web-dir
-│   ├── server.rs     (554)   # axum 路由 / REST / SSE / 静态资源 / 校验端点
-│   ├── chat.rs       (265)   # 按 ptype 分发 + OpenAI 兼容 SSE + 账号故障转移
-│   ├── webchat.rs    (901)   # ChatGPT(PoW) / Claude(sessionKey) 两个网页协议
-│   ├── gemini.rs     (398)   # Gemini 原生协议（streamGenerateContent）
-│   ├── config.rs     (310)   # 配置与账号池、默认预置、迁移逻辑
-│   ├── history.rs    (168)   # 会话持久化（含 meta 字段）
-│   └── providers.rs   (21)   # URL 拼接 / HTTP Client 构造（含代理）
+│   ├── main.rs       (150)   # 入口：数据目录、固定端口、开浏览器、优雅退出、--web-dir/--port
+│   ├── server.rs     (760)   # axum 路由 / REST / SSE / 静态资源 / 上传 / OAuth / 中止
+│   ├── chat.rs       (350)   # 按 ptype 分发 + OpenAI 兼容 SSE + 生图分支 + 账号故障转移
+│   ├── webchat.rs    (940)   # ChatGPT(PoW) / Claude(sessionKey) 两个网页协议 + OAuth 续期
+│   ├── gemini.rs     (410)   # Gemini 原生协议（streamGenerateContent，支持图片 parts）
+│   ├── oauth.rs      (260)   # ChatGPT 官方 OAuth：PKCE、code 兑换、refresh 续期、JWT 解析
+│   ├── chat_attach.rs(180)   # 附件模型 + 多模态内容组装（OpenAI 数组 / Gemini inline_data）
+│   ├── files.rs      (200)   # 上传/生图落盘、安全寻址、附件分类
+│   ├── config.rs     (345)   # 配置与账号池、默认预置、迁移逻辑
+│   ├── history.rs    (175)   # 会话持久化（含 meta 与 attachments）
+│   └── providers.rs  (21)    # URL 拼接 / HTTP Client 构造（含代理）
 └── web/
-    ├── index.html    (137)
-    ├── style.css     (330)
-    ├── app.js        (916)
+    ├── index.html    (155)
+    ├── style.css     (400)
+    ├── app.js        (1180)
     └── vendor/
-        ├── tauri-shim.js   (190)  # 浏览器版核心：伪造 window.__TAURI__
+        ├── tauri-shim.js   (215)  # 浏览器版核心：伪造 window.__TAURI__ + uploadFile
         └── marked.min.js          # Markdown 渲染
 ```
 
@@ -199,6 +211,19 @@ tauri-shim.js  ──把 __TAURI__.core.invoke 翻译成 fetch──┐
 **已知门槛**：Cloudflare 403 / Turnstile / Arkose 人机验证可能间歇性出现，
 出现时本实现会报错并由账号池切下一个账号，不做自动过验证。
 
+**OAuth 登录（新增，推荐）**：账号也可通过官方 OAuth（PKCE 授权码）获得——
+`src/oauth.rs` 按社区项目 `yukkcat/chatgpt2api` 的公开流程实现：
+
+1. `POST /api/oauth/start` 生成 `code_verifier`/`state`，返回 authorize URL；
+2. 用户在系统浏览器登录，回调落在 `platform.openai.com/auth/callback?code=...`；
+3. `POST /api/oauth/finish` 用 code 换 `access_token` + `refresh_token` + `id_token`，
+   JWT 解析出 email / `chatgpt_account_id` 存入账号 meta；
+4. 之后每次对话前检查 AT 临期（<5 分钟）即用 refresh_token 自动续期并写回账号池。
+
+授权参数：`client_id = app_2SKx67EdpoN0G6j64rFvigXD`（公开客户端，无 secret），
+scope `openid profile email offline_access`，兑换端点 `auth.openai.com/api/accounts/oauth/token`，
+续期端点 `auth.openai.com/oauth/token`（form-urlencoded）。
+
 ### 6.4 `claude_web` —— Claude 网页版
 
 账号字段：`secret` = **sessionKey**（Cookie 值，HttpOnly，JS 读不到，需手动复制）。
@@ -234,27 +259,36 @@ tauri-shim.js  ──把 __TAURI__.core.invoke 翻译成 fetch──┐
 | POST | `/api/accounts` | 新增账号（body 为 `{provider_id, account}`） |
 | POST | `/api/accounts/status` | 启用 / 停用账号 |
 | DELETE | `/api/accounts/:id?provider_id=` | 删除账号 |
-| POST | `/api/capture-login-token` | 网页登录抓取的 Token 入库（含 cookie/meta） |
+| POST | `/api/capture-login-token` | 网页登录抓取的 Token 入库（书签脚本跨域 POST 目标，全局 CORS 已放开） |
 | POST | `/api/verify-account` | **添加前真实校验**：Gemini 走 `models`，ChatGPT 走 session 接口，Claude 走 `/api/account` |
 | POST | `/api/models` | 拉取可用模型列表 |
 | GET | `/api/version` | 版本 + 构建时间（界面底部展示，用于核对 exe 新旧） |
-| POST | `/api/chat` | 发起对话（body: provider_id / model / messages / conv_id） |
+| POST | `/api/chat` | 发起对话（body: provider_id / model / messages / conv_id / image_mode） |
+| POST | `/api/chat/stop` | 停止某会话的流式输出（body: `{conv_id}`） |
+| POST | `/api/upload` | 原始字节上传附件（query: name/mime，body 为字节） |
+| GET | `/api/files/:id` | 读取上传的附件文件 |
+| GET | `/api/images/:id` | 读取生图结果（png） |
+| POST | `/api/oauth/start` | ChatGPT OAuth 第一步：生成 PKCE + authorize URL |
+| POST | `/api/oauth/finish` | ChatGPT OAuth 第二步：code 换 token，落账号池 |
 | GET | `/api/conversations` | 会话列表 |
 | POST | `/api/conversations` | 新建会话 |
 | GET | `/api/conversations/:id` | 读取会话（含 messages、meta） |
 | DELETE | `/api/conversations/:id` | 删除会话 |
 | POST | `/api/conversations/:id/rename` | 重命名 |
-| POST | `/api/conversations/:id/messages` | 追加一条消息 |
-| GET | `/api/events` | **SSE 长连接**，推送 `chat_stream` / `account_ok` / `account_switch` 等 |
+| POST | `/api/conversations/:id/messages` | 追加一条消息（body 支持 `attachments`） |
+| GET | `/api/events` | **SSE 长连接**，推送 `chat_stream` / `account_ok` / `account_switch` / `login-captured` 等 |
 | POST | `/api/quit` | 优雅退出（页面关闭时 sendBeacon 调用） |
-| GET | `/api/open-login` | ⚠️ 遗留端点，Tauri 版残留，浏览器版未使用 |
 | GET | `/*path` | 静态资源兜底（内嵌或 `--web-dir`） |
+
+> 所有接口监听 `127.0.0.1`，无鉴权（单用户本机应用）。响应统一带 CORS 头，
+> 这是书签脚本能从 `chatgpt.com` 页面跨域回传 Token 的前提。
 
 **前端 → 后端命令映射**（`tauri-shim.js`）：
 `get-config` / `save-config` / `get-accounts` / `save-account` / `delete-account` /
-`set-account-status` / `capture-login-token` / `verify-account` / `chat-stream` /
-`list-conversations` / `create-conversation` / `get-conversation` / `delete-conversation` /
-`rename-conversation` / `save-message` / `open-login-window`(遗留) / `close-login-window`(遗留)
+`set-account-status` / `capture-login-token` / `verify-account` / `chat-stream` / `chat-stop` /
+`oauth-start` / `oauth-finish` / `list-conversations` / `create-conversation` / `get-conversation` /
+`delete-conversation` / `rename-conversation` / `save-message`；
+另暴露非 invoke 助手 `TAURI.core.uploadFile(name, mime, bytes)`（原始字节上传）。
 
 ---
 
@@ -266,6 +300,8 @@ tauri-shim.js  ──把 __TAURI__.core.invoke 翻译成 fetch──┐
 ai-hub/
 ├── config.json           # 服务 + 账号池
 ├── startup.log           # 每次启动记录实际端口（排障用）
+├── uploads/              # 聊天附件（图片/文本/文件，内容哈希命名）
+├── images/               # 生图结果（png，内容哈希命名）
 └── conversations/
     └── {conv_id}.json    # 单个会话，含 messages 与 meta
 ```
@@ -337,12 +373,22 @@ cargo build --release --target x86_64-pc-windows-gnu
 产物特性：约 4.9–5.1MB，仅 import `kernel32` / `ws2_32` / `bcrypt` 等系统 DLL，
 **无 OpenSSL、无 WebView2、无 libgcc 外部依赖**。
 
+### GitHub Actions（推荐，免本地环境）
+
+`.github/workflows/build.yml`：push 到 main 或手动 dispatch 时，
+在 windows-latest 跑 `cargo test --release` + `cargo build --release`，
+ubuntu-latest 出 Linux 二进制，产物以 artifact 形式上传（`ai-hub-web-windows-x86_64` 内含 exe）。
+
 ### 运行时参数
 
 ```bash
-ai-hub-web.exe                 # 默认：内嵌前端 + 随机端口 + 自动开浏览器
+ai-hub-web.exe                 # 默认：内嵌前端 + 固定端口 25880 + 自动开浏览器
+ai-hub-web.exe --port 9000     # 指定端口（也可用环境变量 AI_HUB_PORT）
 ai-hub-web.exe --web-dir ./web # 从磁盘读前端，改完刷新即可生效（开发用）
 ```
+
+端口策略：**固定端口优先**（书签脚本回传、OAuth 回调都依赖端口稳定），
+被占用时自动回退随机端口并记入 `startup.log`。
 
 ### 环境变量
 
@@ -379,45 +425,30 @@ ai-hub-web.exe --web-dir ./web # 从磁盘读前端，改完刷新即可生效�
 
 ## 十一、已知问题（重要，按优先级）
 
-### 1. 缺少「接入方式」切换 UI —— 最需要补
+### 1. ~~缺少「接入方式」切换 UI~~ —— 已修复
 
-预置的 ChatGPT / Claude 卡片 `ptype` 固定为网页版协议，
-界面上**没有下拉可以把它们切成「反代 / 官方 API」模式**。
+每张服务卡现有「接入方式」下拉：ChatGPT / Claude 可切「网页版 ⇄ OpenAI 兼容（反代）」，
+Gemini 可切「官方原生 ⇄ OpenAI 兼容层」，切换时联动字段标签与账号池按钮。
 
-后果：用户想给 ChatGPT 填反代地址时，卡片显示的是「站点地址」而不是「基础 URL」，无处可填。
+### 2. ~~账号池两个按钮对网页版端点行为相同~~ —— 已修复
 
-临时规避：用「＋ 添加自定义端点」新建一个 OpenAI 兼容端点。
-
-**建议修复**：每张卡片增加「接入方式」下拉，切换时联动字段与按钮。
-
-### 2. 账号池两个按钮对网页版端点行为相同
-
-`openKeyModal()` 里有这段重定向：
-
-```js
-if (p.ptype === "chatgpt_web" || p.ptype === "claude_web") {
-  openCapture(pid);   // 转去抓取弹窗
-  return;
-}
-```
-
-导致「网页登录抓 Token」和「＋ 添加 API Key」对这两个服务点出来是同一个弹窗，用户会困惑。
-建议：按 `ptype` 只显示其中一个按钮。
+`renderAccounts()` 现按 `ptype` 只显示一个按钮：网页版端点只显示「网页登录抓 Token」，
+Key 类端点只显示「＋ 手动填 Key」。
 
 ### 3. 网页版协议无真实账号验证
 
 仅通过 mock 验证。若真机失效，排查顺序：
 dpl 提取 → sentinel 接口字段 → PoW 难度算法 → conversation 请求体字段。
 
-### 4. 流式取消未实现
+### 4. ~~流式取消未实现~~ —— 已实现
 
-前端有 `#stop` 按钮，但后端未提供中断信号；`stream_chat` 一旦启动只能等它自然结束。
-建议：用 `CancellationToken` 或按 `conv_id` 记录 abort 标志。
+`POST /api/chat/stop {conv_id}` 置位中止标志；chat/gemini/webchat 三条流式循环
+每个 chunk 前检查标志，收到后立即收尾（无输出时回 `已停止` 错误）。
 
-### 5. 遗留死代码
+### 5. ~~遗留死代码~~ —— 已清理
 
-`/api/open-login`、`open-login-window`、`close-login-window` 是 Tauri 版残留，
-浏览器版不调用，可安全删除。
+`/api/open-login`、`open_login` 处理器已删除；shim 里的 `open-login-window` /
+`close-login-window` 仍保留（Tauri 版兼容，无副作用）。
 
 ### 6. debug 构建下 PoW 极慢
 
@@ -429,21 +460,25 @@ dpl 提取 → sentinel 接口字段 → PoW 难度算法 → conversation 请�
 无鉴权、无多用户隔离、broadcast 频道全量推送。
 若要多开或局域网访问，需重新设计鉴权与事件路由。
 
+### 8. 生图仅覆盖 OpenAI 兼容端点
+
+`/images/generations` 分支只对 `openai` 类型 provider 生效；
+Gemini 原生图片模型（imagen 等）与网页版协议内的生图均未接。
+
 ---
 
 ## 十二、后续待办建议
 
 按性价比排序：
 
-1. **接入方式切换 UI**（见已知问题 1）—— 解决最大的可用性坑
-2. **流式取消**（已知问题 4）—— 长回复时很需要
-3. **账号池按钮去重**（已知问题 2）
-4. **真实账号回归测试** —— 有代理和 Plus 账号后跑一遍，记录失效点
+1. **OAuth / 网页版真实账号回归测试** —— 有 ChatGPT 账号后跑一遍 OAuth 登录与续期，记录失效点
+2. **Gemini 原生生图**（imagen / 图片预览模型走 `generateContent`）
+3. **ChatGPT 网页版生图**（`/backend-api/files` 上传 + 多模态消息）
+4. **Claude 官方 API 协议**（`/v1/messages` + `x-api-key`），比网页版稳定
 5. **安装包**：NSIS / MSI，带开始菜单快捷方式与卸载
-6. **托盘 + 单实例**：避免重复启动起多个服务
+6. **托盘 + 单实例**：避免重复启动起多个服务（固定端口已部分缓解）
 7. **会话搜索 / 导出 Markdown**
-8. **Claude 官方 API 协议**（`/v1/messages` + `x-api-key`），比网页版稳定
-9. **代理配置细化**：目前是整服务一个 proxy，可细化到「仅网页版走代理」
+8. **代理配置细化**：目前是整服务一个 proxy，可细化到「仅网页版走代理」
 
 ---
 
@@ -464,7 +499,7 @@ dpl 提取 → sentinel 接口字段 → PoW 难度算法 → conversation 请�
 git clone <repo>
 cd ai-hub-web
 cargo build --release
-./target/release/ai-hub-web          # 浏览器自动打开
+./target/release/ai-hub-web          # 浏览器自动打开（固定端口 25880）
 ```
 
 1. 点左下角「⚙ 设置 / 账号池」

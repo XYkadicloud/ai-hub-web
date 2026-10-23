@@ -1,3 +1,4 @@
+use crate::chat_attach::Attachment;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -8,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Msg {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     pub ts: i64,
 }
 
@@ -135,7 +138,13 @@ pub fn rename_conversation(dir: &Path, id: &str, title: &str) -> Result<(), Stri
     Ok(())
 }
 
-pub fn save_message(dir: &Path, id: &str, role: &str, content: &str) -> Result<(), String> {
+pub fn save_message(
+    dir: &Path,
+    id: &str,
+    role: &str,
+    content: &str,
+    attachments: Vec<Attachment>,
+) -> Result<(), String> {
     let p = conv_path(dir, id);
     if !p.exists() {
         return Err("会话不存在".into());
@@ -156,6 +165,7 @@ pub fn save_message(dir: &Path, id: &str, role: &str, content: &str) -> Result<(
     c.messages.push(Msg {
         role: role.to_string(),
         content: content.to_string(),
+        attachments,
         ts: now(),
     });
     c.updated = now();

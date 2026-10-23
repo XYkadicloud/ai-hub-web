@@ -90,7 +90,26 @@
                 model: args.model,
                 messages: args.messages,
                 conv_id: args.conv_id,
+                image_mode: !!args.image_mode,
               };
+              hasBody = true;
+              break;
+            case "chat-stop":
+              method = "POST";
+              url = "/api/chat/stop";
+              body = { conv_id: args.conv_id };
+              hasBody = true;
+              break;
+            case "oauth-start":
+              method = "POST";
+              url = "/api/oauth/start";
+              body = { email_hint: args.email_hint };
+              hasBody = true;
+              break;
+            case "oauth-finish":
+              method = "POST";
+              url = "/api/oauth/finish";
+              body = { session_id: args.session_id, callback: args.callback };
               hasBody = true;
               break;
             case "list-conversations":
@@ -123,7 +142,11 @@
             case "save-message":
               method = "POST";
               url = "/api/conversations/" + encodeURIComponent(args.id) + "/messages";
-              body = { role: args.role, content: args.content };
+              body = {
+                role: args.role,
+                content: args.content,
+                attachments: args.attachments || [],
+              };
               hasBody = true;
               break;
             case "open-login-window":
@@ -164,6 +187,25 @@
   };
 
   window.__TAURI__ = TAURI;
+
+  // 文件上传：原始字节 POST（不走 multipart，省依赖也省包体）
+  TAURI.core.uploadFile = async function (name, mime, bytes) {
+    var url =
+      "/api/upload?name=" +
+      encodeURIComponent(name) +
+      "&mime=" +
+      encodeURIComponent(mime || "application/octet-stream");
+    var res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: bytes,
+    });
+    if (!res.ok) {
+      var t = await res.text();
+      throw new Error(t || "HTTP " + res.status);
+    }
+    return res.json();
+  };
 
   // 打开 SSE 通道，按事件名分发
   try {

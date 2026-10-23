@@ -31,16 +31,21 @@
 
         <div id="messages" class="messages"></div>
 
+        <div id="attachTray" class="attach-tray hidden"></div>
+
         <div id="composer">
           <textarea
             id="input"
             placeholder="给 AI 发消息…  (Enter 发送 / Shift+Enter 换行)"
           ></textarea>
           <div class="composer-btns">
+            <button id="imgToggle" class="ghost sm" title="生图模式：把本次发送当作绘图提示词">🎨</button>
+            <button id="attachBtn" class="ghost sm" title="上传文件（图片/文本，可多选）">📎</button>
             <button id="stop" class="hidden" title="停止">■</button>
             <button id="send" title="发送">➤</button>
           </div>
         </div>
+        <input id="fileInput" type="file" multiple class="hidden" />
       </main>
     </div>
 
@@ -113,6 +118,21 @@
         </div>
         <div class="cap-body">
           <div id="capSteps" class="cap-steps"></div>
+
+          <!-- ChatGPT OAuth 一键登录 -->
+          <div id="capOauthWrap" class="hidden">
+            <div class="cap-oauth">
+              <button id="capOauthStart" class="primary sm">🔑 打开 OpenAI 授权页</button>
+              <span class="hint">用官方 OAuth 登录，自动续期，无需手动抓包</span>
+            </div>
+            <label class="cap-label">授权完成后，把浏览器地址栏的完整网址粘贴到这里</label>
+            <textarea id="capOauthCallback" rows="2" placeholder="https://platform.openai.com/auth/callback?code=...&state=..." spellcheck="false"></textarea>
+            <div class="cap-oauth">
+              <button id="capOauthFinish" class="primary sm">完成登录</button>
+              <span id="capOauthHint" class="hint">授权页登录后会跳转到一个显示错误的页面，属正常现象，复制地址栏网址即可</span>
+            </div>
+          </div>
+
           <label class="cap-label" id="capInputLabel">粘贴 Token</label>
           <textarea id="capInput" rows="4" placeholder=""></textarea>
           <div id="capCookieWrap" class="hidden">

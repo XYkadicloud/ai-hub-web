@@ -308,3 +308,27 @@ pub fn set_account_status(
         }
     })
 }
+
+/// 更新账号凭据（OAuth 续期后写回新的 access_token / meta）。
+pub fn update_account(
+    dir: &Path,
+    provider_id: &str,
+    account_id: &str,
+    secret: Option<String>,
+    meta: Option<serde_json::Value>,
+) {
+    let _ = with_provider(dir, provider_id, |p| {
+        if let Some(a) = p.accounts.iter_mut().find(|a| a.id == account_id) {
+            if let Some(s) = secret {
+                a.secret = s;
+                if a.status == "error" {
+                    a.status = "active".into();
+                    a.last_error = None;
+                }
+            }
+            if let Some(m) = meta {
+                a.meta = Some(m);
+            }
+        }
+    });
+}

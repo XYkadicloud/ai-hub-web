@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 单元测试（PoW 正确性）
+        run: cargo test --release
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 编译 release（MSVC）
+        run: cargo build --release
+      - name: 打包 exe
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/ai-hub-web.exe dist/
+          cp README.md HANDOVER.md dist/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-hub-web-windows-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  build-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 编译 release
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-hub-web-linux-x86_64
+          path: target/release/ai-hub-web
+          if-no-files-found: error

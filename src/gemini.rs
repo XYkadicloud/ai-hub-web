@@ -11,13 +11,20 @@
 //! 相比兼容层，原生协议能保留 systemInstruction、思维链、联网等能力，
 //! 且不依赖 Google 的兼容适配层。
 
-use crate::chat::{ChatEvent, ChatMessage};
+use crate::chat::{AbortFlag, ChatEvent, ChatMessage};
+use crate::chat_attach::build_gemini_parts;
 use crate::config::{load_config, mark_account_error, resolve_accounts, touch_account};
 use crate::providers::build_client;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::path::Path;
 use tokio::sync::mpsc;
+
+fn is_aborted(abort: &Option<AbortFlag>) -> bool {
+    abort.as_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+}
 
 /// 默认原生端点（不含 /openai 后缀）。
 pub const DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -33,7 +40,7 @@ fn model_id(model: &str) -> String {
 }
 
 /// 把内部消息列表转换为 Gemini 的 contents + systemInstruction。
-fn build_body(model: &str, messages: &[ChatMessage]) -> Value {
+fn build_body(dir: &Path, model: &str, messages: &[ChatMessage]) -> Value {
     let mut contents: Vec<Value> = Vec::new();
     let mut system: Vec<String> = Vec::new();
 
@@ -47,7 +54,7 @@ fn build_body(model: &str, messages: &[ChatMessage]) -> Value {
         let r = if role == "assistant" { "model" } else { "user" };
         contents.push(json!({
             "role": r,
-            "parts": [{ "text": m.content }]
+            "parts": build_gemini_parts(dir, m)
         }));
     }
 
@@ -80,8 +87,9 @@ pub async fn stream_gemini(
     model: &str,
     messages: &[ChatMessage],
     tx: mpsc::UnboundedSender<ChatEvent>,
+    abort: Option<AbortFlag>,
 ) {
-    if let Err(e) = run(dir, provider_id, model, messages, &tx).await {
+    if let Err(e) = run(dir, provider_id, model, messages, &tx, &abort).await {
         let _ = tx.send(ChatEvent::Error(e));
     }
 }
@@ -92,6 +100,7 @@ async fn run(
     model: &str,
     messages: &[ChatMessage],
     tx: &mpsc::UnboundedSender<ChatEvent>,
+    abort: &Option<AbortFlag>,
 ) -> Result<(), String> {
     let cfg = load_config(dir)?;
     let provider = cfg
@@ -111,10 +120,13 @@ async fn run(
     let base = normalize_base(&provider.base_url);
     let mid = model_id(model);
     let url = format!("{}/models/{}:streamGenerateContent?alt=sse", base, mid);
-    let mut body = build_body(model, messages);
+    let mut body = build_body(dir, model, messages);
     body.as_object_mut().map(|o| o.remove("_model_hint"));
 
     for acc in accounts {
+        if is_aborted(abort) {
+            return Ok(());
+        }
         let key = acc.secret.trim().to_string();
         if key.is_empty() {
             let _ = tx.send(ChatEvent::Switch {
@@ -137,7 +149,7 @@ async fn run(
                     let _ = tx.send(ChatEvent::Active {
                         account: acc.name.clone(),
                     });
-                    match stream_response(resp, tx).await {
+                    match stream_response(resp, tx, abort).await {
                         Ok(_) => {
                             touch_account(dir, provider_id, &acc.id);
                             let _ = tx.send(ChatEvent::Done);
@@ -183,6 +195,7 @@ async fn run(
 async fn stream_response(
     resp: reqwest::Response,
     tx: &mpsc::UnboundedSender<ChatEvent>,
+    abort: &Option<AbortFlag>,
 ) -> Result<(), String> {
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
@@ -191,6 +204,9 @@ async fn stream_response(
     let mut block_reason: Option<String> = None;
 
     while let Some(chunk) = stream.next().await {
+        if is_aborted(abort) {
+            return Ok(());
+        }
         let chunk = chunk.map_err(|e| format!("读取响应流失败: {}", e))?;
         let text = String::from_utf8_lossy(&chunk);
         buf.push_str(&text);

@@ -11,9 +11,11 @@
 //! 说明：这类接口随时可能被官方调整或加强风控而失效，属预期风险；账号池的
 //! 自动切换逻辑可缓解单账号失效，但无法对抗协议级变更。
 
-use crate::chat::{ChatEvent, ChatMessage};
-use crate::config::{load_config, mark_account_error, resolve_accounts, touch_account};
+use crate::chat::{AbortFlag, ChatEvent, ChatMessage};
+use crate::chat_attach::build_web_text;
+use crate::config::{load_config, mark_account_error, resolve_accounts, touch_account, update_account};
 use crate::history;
+use crate::oauth;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::Utc;
@@ -27,6 +29,19 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+
+fn is_aborted(abort: &Option<AbortFlag>) -> bool {
+    abort.as_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 const CHATGPT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 const CLAUDE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
@@ -61,8 +76,9 @@ pub async fn stream_web_chat(
     messages: &[ChatMessage],
     conv_id: &str,
     tx: mpsc::UnboundedSender<ChatEvent>,
+    abort: Option<AbortFlag>,
 ) {
-    if let Err(e) = run_web(dir, provider_id, model, messages, conv_id, &tx).await {
+    if let Err(e) = run_web(dir, provider_id, model, messages, conv_id, &tx, &abort).await {
         let _ = tx.send(ChatEvent::Error(e));
     }
 }
@@ -74,6 +90,7 @@ async fn run_web(
     messages: &[ChatMessage],
     conv_id: &str,
     tx: &mpsc::UnboundedSender<ChatEvent>,
+    abort: &Option<AbortFlag>,
 ) -> Result<(), String> {
     let cfg = load_config(dir)?;
     let provider = cfg
@@ -98,7 +115,10 @@ async fn run_web(
     let cur_meta = base_meta;
 
     for acc in accounts {
-        let sec = acc.secret.trim().to_string();
+        if is_aborted(abort) {
+            return Ok(());
+        }
+        let mut sec = acc.secret.trim().to_string();
         if sec.is_empty() {
             mark_account_error(dir, provider_id, &acc.id, "账号为空");
             let _ = tx.send(ChatEvent::Switch {
@@ -106,6 +126,57 @@ async fn run_web(
                 reason: "账号为空".into(),
             });
             continue;
+        }
+
+        // ChatGPT OAuth 账号自动续期：带 refresh_token 且 access_token 临期时先刷新
+        if provider.ptype == "chatgpt_web" {
+            let rt = acc
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("refresh_token"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(rt) = rt {
+                let exp = oauth::jwt_exp(&sec).unwrap_or(0);
+                if exp - now_secs() < 300 {
+                    match oauth::refresh_token(&client, &rt).await {
+                        Ok(ts) => {
+                            let mut meta = acc.meta.clone().unwrap_or(Value::Object(Default::default()));
+                            if let Some(obj) = meta.as_object_mut() {
+                                if let Some(rt2) = &ts.refresh_token {
+                                    obj.insert("refresh_token".into(), json!(rt2));
+                                }
+                                if let Some(idt) = &ts.id_token {
+                                    if let Some(c) = oauth::parse_jwt_claims(idt) {
+                                        if let Some(e) = c.email {
+                                            obj.insert("email".into(), json!(e));
+                                        }
+                                        if let Some(a) = c.chatgpt_account_id {
+                                            obj.insert("chatgpt_account_id".into(), json!(a));
+                                        }
+                                    }
+                                }
+                            }
+                            update_account(
+                                dir,
+                                provider_id,
+                                &acc.id,
+                                Some(ts.access_token.clone()),
+                                Some(meta),
+                            );
+                            sec = ts.access_token;
+                        }
+                        Err(e) => {
+                            mark_account_error(dir, provider_id, &acc.id, &e);
+                            let _ = tx.send(ChatEvent::Switch {
+                                account: acc.name.clone(),
+                                reason: format!("Token 续期失败: {}", e),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         let _ = tx.send(ChatEvent::Active {
@@ -117,6 +188,7 @@ async fn run_web(
             "chatgpt_web" => {
                 chatgpt_send(
                     &client,
+                    dir,
                     &provider.base_url,
                     &sec,
                     acc.cookie.as_deref(),
@@ -124,6 +196,7 @@ async fn run_web(
                     messages,
                     attempt,
                     tx,
+                    abort,
                 )
                 .await
             }
@@ -136,6 +209,7 @@ async fn run_web(
                     messages,
                     attempt,
                     tx,
+                    abort,
                 )
                 .await
             }
@@ -181,6 +255,7 @@ fn save_meta(dir: &Path, conv_id: &str, m: &WebMeta) {
 
 async fn chatgpt_send(
     client: &Client,
+    dir: &Path,
     base_url: &str,
     token: &str,
     cookie: Option<&str>,
@@ -188,6 +263,7 @@ async fn chatgpt_send(
     messages: &[ChatMessage],
     mut meta: WebMeta,
     tx: &mpsc::UnboundedSender<ChatEvent>,
+    abort: &Option<AbortFlag>,
 ) -> Result<WebMeta, String> {
     let host = base_url.trim().trim_end_matches('/');
     let host = if host.is_empty() {
@@ -251,14 +327,14 @@ async fn chatgpt_send(
         None
     };
 
-    // 2) 组装消息体
+    // 2) 组装消息体（附件降级为文字说明）
     let chat_messages: Vec<Value> = messages
         .iter()
         .map(|m| {
             json!({
                 "id": new_uuid(),
                 "author": { "role": m.role },
-                "content": { "content_type": "text", "parts": [m.content] },
+                "content": { "content_type": "text", "parts": [build_web_text(dir, m)] },
                 "metadata": {}
             })
         })
@@ -319,6 +395,13 @@ async fn chatgpt_send(
     let mut buf = String::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
+        if is_aborted(abort) {
+            return if emitted.is_empty() {
+                Err("已停止".into())
+            } else {
+                Ok(meta)
+            };
+        }
         let chunk = chunk.map_err(|e| format!("读取响应流失败: {}", e))?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(idx) = buf.find("\n\n") {
@@ -390,6 +473,7 @@ async fn claude_send(
     messages: &[ChatMessage],
     mut meta: WebMeta,
     tx: &mpsc::UnboundedSender<ChatEvent>,
+    abort: &Option<AbortFlag>,
 ) -> Result<WebMeta, String> {
     let base = base_url.trim().trim_end_matches('/');
     let base = if base.is_empty() {
@@ -467,8 +551,11 @@ async fn claude_send(
         c
     };
 
-    // 3) 组装 completion 请求体
-    let prompt = messages.last().map(|m| m.content.clone()).unwrap_or_default();
+    // 3) 组装 completion 请求体（附件降级拼进 prompt）
+    let last = messages.last();
+    let prompt = last
+        .map(|m| crate::chat_attach::build_web_text(Path::new(""), m))
+        .unwrap_or_default();
     let is_follow_up = meta.claude_parent_uuid.is_some();
     let mut body = json!({
         "prompt": prompt,
@@ -525,6 +612,9 @@ async fn claude_send(
     let mut stream = resp.bytes_stream();
     let mut got = false;
     while let Some(chunk) = stream.next().await {
+        if is_aborted(abort) {
+            return if got { Ok(meta) } else { Err("已停止".into()) };
+        }
         let chunk = chunk.map_err(|e| format!("读取响应流失败: {}", e))?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(idx) = buf.find("\n\n") {

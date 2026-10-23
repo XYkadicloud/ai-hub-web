@@ -1,10 +1,14 @@
-use crate::chat::{self, ChatEvent, ChatMessage};
+use crate::chat::{self, AbortFlag, ChatEvent, ChatMessage};
+use crate::chat_attach::Attachment;
 use crate::config::{self, Account, AppConfig};
+use crate::files;
 use crate::history::{self, Conversation};
+use crate::oauth::{self, PendingOAuth};
 use crate::webchat;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
@@ -12,8 +16,9 @@ use axum::{
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, Notify};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
@@ -37,6 +42,10 @@ pub struct AppState {
     pub shutdown: Arc<Notify>,
     /// 指定后优先从磁盘读前端（`--web-dir`），便于改 UI 不必重新编译。
     pub web_dir: Option<PathBuf>,
+    /// conv_id → 流式中止标志（前端点「停止」时置位）。
+    pub aborts: Arc<Mutex<HashMap<String, AbortFlag>>>,
+    /// session_id → 待完成的 ChatGPT OAuth 授权会话（带创建时间，10 分钟过期）。
+    pub oauth_pending: Arc<Mutex<HashMap<String, (PendingOAuth, i64)>>>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -48,11 +57,20 @@ pub fn build_router(state: AppState) -> Router {
             get(get_accounts).post(add_account).delete(del_account),
         )
         .route("/api/accounts/status", post(set_status))
-        .route("/api/capture-login-token", post(capture_token))
+        .route(
+            "/api/capture-login-token",
+            post(capture_token).options(capture_preflight),
+        )
         .route("/api/verify-account", post(verify_account))
         .route("/api/models", post(list_models))
         .route("/api/version", get(version))
         .route("/api/chat", post(chat))
+        .route("/api/chat/stop", post(chat_stop))
+        .route("/api/upload", post(upload))
+        .route("/api/files/:id", get(serve_file))
+        .route("/api/images/:id", get(serve_image))
+        .route("/api/oauth/start", post(oauth_start))
+        .route("/api/oauth/finish", post(oauth_finish))
         .route("/api/conversations", get(list_convs).post(create_conv))
         .route(
             "/api/conversations/:id",
@@ -62,9 +80,39 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/conversations/:id/messages", post(save_msg))
         .route("/api/events", get(events))
         .route("/api/quit", post(quit))
-        .route("/api/open-login", get(open_login))
         .route("/*path", get(static_handler))
+        .layer(DefaultBodyLimit::max(48 * 1024 * 1024))
+        .layer(middleware::from_fn(cors_layer))
         .with_state(state)
+}
+
+/// 全局 CORS：本地服务 + 浏览器书签脚本跨域回传需要。
+/// 只监听 127.0.0.1，且所有接口本就面向本机单用户，放开来源没有额外风险。
+async fn cors_layer(req: axum::extract::Request, next: Next) -> Response {
+    let is_preflight = req.method() == axum::http::Method::OPTIONS;
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        "*".parse().unwrap(),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        "GET, POST, DELETE, OPTIONS".parse().unwrap(),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        "Content-Type, Authorization, X-File-Name, X-File-Type".parse().unwrap(),
+    );
+    if is_preflight {
+        *resp.status_mut() = StatusCode::NO_CONTENT;
+    }
+    resp
+}
+
+/// 书签脚本 preflight 兜底（被 cors_layer 覆盖，这里显式声明意图）。
+async fn capture_preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 // ---------- 错误类型 ----------
@@ -346,6 +394,9 @@ struct ChatBody {
     model: String,
     messages: Vec<ChatMessage>,
     conv_id: String,
+    /// 🎨 生图开关（手动）；模型名命中生图模型时后端也会自动走生图分支。
+    #[serde(default)]
+    image_mode: bool,
 }
 async fn chat(State(s): State<AppState>, Json(b): Json<ChatBody>) -> Result<Json<Value>, AppErr> {
     let (mtx, mut mrx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
@@ -354,12 +405,35 @@ async fn chat(State(s): State<AppState>, Json(b): Json<ChatBody>) -> Result<Json
     let model = b.model.clone();
     let msgs = b.messages.clone();
     let conv_for_chat = b.conv_id.clone();
+    let image_mode = b.image_mode;
+
+    // 登记中止标志；同会话上次还在跑的任务先停掉
+    let flag: AbortFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut map = s.aborts.lock().unwrap();
+        if let Some(old) = map.insert(conv_for_chat.clone(), flag.clone()) {
+            old.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let flag_for_task = flag.clone();
     tokio::spawn(async move {
-        chat::stream_chat(&dir, &pid, &model, &msgs, &conv_for_chat, mtx).await;
+        chat::stream_chat(
+            &dir,
+            &pid,
+            &model,
+            &msgs,
+            &conv_for_chat,
+            mtx,
+            image_mode,
+            Some(flag_for_task),
+        )
+        .await;
     });
 
     let tx = s.tx.clone();
     let conv_id = b.conv_id.clone();
+    let aborts = s.aborts.clone();
+    let flag_done = flag.clone();
     tokio::spawn(async move {
         while let Some(ev) = mrx.recv().await {
             let (event, payload) = match ev {
@@ -390,8 +464,199 @@ async fn chat(State(s): State<AppState>, Json(b): Json<ChatBody>) -> Result<Json
                 break;
             }
         }
+        // 流结束：清理中止标志（仅当还是自己这一个）
+        if let Ok(mut map) = aborts.lock() {
+            if let Some(cur) = map.get(&conv_id) {
+                if Arc::ptr_eq(cur, &flag_done) {
+                    map.remove(&conv_id);
+                }
+            }
+        }
     });
     Ok(Json(json!({"ok": true})))
+}
+
+/// 停止某个会话的流式输出。
+#[derive(Deserialize)]
+struct StopBody {
+    conv_id: String,
+}
+async fn chat_stop(State(s): State<AppState>, Json(b): Json<StopBody>) -> StatusCode {
+    if let Ok(map) = s.aborts.lock() {
+        if let Some(f) = map.get(&b.conv_id) {
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    StatusCode::OK
+}
+
+// ---------- 文件上传 / 本地文件读取 ----------
+#[derive(Deserialize)]
+struct UploadQuery {
+    name: String,
+    #[serde(default)]
+    mime: Option<String>,
+}
+/// 原始字节上传（不做 multipart，省依赖）：
+/// POST /api/upload?name=xx.png&mime=image/png，body 为文件字节。
+async fn upload(
+    State(s): State<AppState>,
+    Query(q): Query<UploadQuery>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, AppErr> {
+    if body.is_empty() {
+        return Err(AppErr("上传内容为空".into()));
+    }
+    let saved = files::save_upload(&s.data_dir, &q.name, q.mime.as_deref().unwrap_or(""), &body)
+        .map_err(AppErr::from)?;
+    let url = format!("/api/files/{}", saved.id);
+    Ok(Json(json!({
+        "id": saved.id,
+        "name": saved.name,
+        "mime": saved.mime,
+        "size": saved.size,
+        "kind": saved.kind.as_str(),
+        "text": saved.text,
+        "url": url,
+    })))
+}
+
+async fn serve_file(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    match files::read_upload(&s.data_dir, &id) {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, content_type(&id)),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+async fn serve_image(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    match files::read_image(&s.data_dir, &id) {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, content_type(&id)),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+// ---------- ChatGPT OAuth 登录 ----------
+#[derive(Deserialize)]
+struct OauthStartBody {
+    #[serde(default)]
+    email_hint: Option<String>,
+}
+/// 第一步：生成 PKCE + authorize URL，由前端打开让用户登录。
+async fn oauth_start(
+    State(s): State<AppState>,
+    Json(b): Json<OauthStartBody>,
+) -> Result<Json<Value>, AppErr> {
+    let (verifier, challenge) = oauth::generate_pkce();
+    let session_id = oauth::random_hex(16);
+    let state = format!("{}.{}", session_id, oauth::random_hex(8));
+    let pending = PendingOAuth {
+        code_verifier: verifier,
+        code_challenge: challenge,
+        state,
+    };
+    let url = oauth::authorize_url(&pending, b.email_hint.as_deref().unwrap_or(""));
+    {
+        let mut map = s.oauth_pending.lock().unwrap();
+        // 清理 10 分钟前的过期会话
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        map.retain(|_, (_, ts)| now - *ts < 600);
+        map.insert(session_id.clone(), (pending, now));
+    }
+    Ok(Json(json!({ "session_id": session_id, "authorize_url": url })))
+}
+
+#[derive(Deserialize)]
+struct OauthFinishBody {
+    session_id: String,
+    /// 用户从 platform.openai.com/auth/callback 地址栏复制的完整 URL（或裸 code）
+    callback: String,
+}
+/// 第二步：用 code 换 token，落账号池。
+async fn oauth_finish(
+    State(s): State<AppState>,
+    Json(b): Json<OauthFinishBody>,
+) -> Result<Json<Value>, AppErr> {
+    let pending = {
+        let map = s.oauth_pending.lock().unwrap();
+        map.get(&b.session_id).map(|(p, _)| p.clone())
+    };
+    let Some(pending) = pending else {
+        return Err(AppErr("OAuth 会话已过期或不存在，请重新点「打开授权页」".into()));
+    };
+    let (code, state) = oauth::extract_code(&b.callback)?;
+    if !state.is_empty() && state != pending.state {
+        return Err(AppErr(
+            "state 不匹配：可能点过两次「打开授权页」。请重新生成再走一遍。".into(),
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| AppErr(e.to_string()))?;
+    let tokens = oauth::exchange_code(&client, &code, &pending.code_verifier).await?;
+
+    // 解析 id_token 拿邮箱 / 账号 ID
+    let claims = tokens
+        .id_token
+        .as_deref()
+        .and_then(oauth::parse_jwt_claims);
+    let mut meta = serde_json::Map::new();
+    if let Some(rt) = &tokens.refresh_token {
+        meta.insert("refresh_token".into(), json!(rt));
+    }
+    if let Some(c) = &claims {
+        if let Some(e) = &c.email {
+            meta.insert("email".into(), json!(e));
+        }
+        if let Some(a) = &c.chatgpt_account_id {
+            meta.insert("chatgpt_account_id".into(), json!(a));
+        }
+        if let Some(p) = &c.chatgpt_plan_type {
+            meta.insert("plan_type".into(), json!(p));
+        }
+    }
+    let acc = Account {
+        id: String::new(),
+        name: claims
+            .as_ref()
+            .and_then(|c| c.email.clone())
+            .unwrap_or_else(|| "ChatGPT OAuth 账号".into()),
+        cred_type: "token".into(),
+        secret: tokens.access_token,
+        cookie: None,
+        meta: Some(Value::Object(meta)),
+        status: "active".into(),
+        last_error: None,
+        last_used: None,
+        priority: 0,
+    };
+    let saved = config::add_account(&s.data_dir, "chatgpt", acc).map_err(AppErr::from)?;
+    {
+        let mut map = s.oauth_pending.lock().unwrap();
+        map.remove(&b.session_id);
+    }
+    let _ = s.tx.send(ServerEvent {
+        event: "login-captured".into(),
+        payload: json!({ "provider": "chatgpt", "account": saved.name }),
+    });
+    Ok(Json(json!({ "ok": true, "account": saved })))
 }
 
 // ---------- 会话历史 ----------
@@ -440,13 +705,16 @@ async fn rename_conv(
 struct SaveMsgBody {
     role: String,
     content: String,
+    #[serde(default)]
+    attachments: Vec<Attachment>,
 }
 async fn save_msg(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Json(b): Json<SaveMsgBody>,
 ) -> Result<StatusCode, AppErr> {
-    history::save_message(&s.data_dir, &id, &b.role, &b.content).map_err(AppErr::from)?;
+    history::save_message(&s.data_dir, &id, &b.role, &b.content, b.attachments)
+        .map_err(AppErr::from)?;
     Ok(StatusCode::OK)
 }
 
@@ -466,17 +734,9 @@ async fn events(
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
-// ---------- 退出 / 打开登录页 ----------
+// ---------- 退出 ----------
 async fn quit(State(s): State<AppState>) -> StatusCode {
     s.shutdown.notify_one();
-    StatusCode::OK
-}
-#[derive(Deserialize)]
-struct OpenLoginQuery {
-    url: String,
-}
-async fn open_login(Query(q): Query<OpenLoginQuery>) -> StatusCode {
-    let _ = open::that(&q.url);
     StatusCode::OK
 }
 
@@ -543,6 +803,9 @@ fn content_type(path: &str) -> String {
         "json" | "map" => "application/json",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
         "svg" => "image/svg+xml",
         "ico" => "image/x-icon",
         "woff2" => "font/woff2",

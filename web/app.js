@@ -19,6 +19,9 @@
   let streaming = false;
   let capturePid = null; // 当前正在抓取登录的 provider id
   let keyPid = null; // 当前正在添加 Key 的 provider id
+  let imageMode = false; // 🎨 生图开关
+  let pendingAttachments = []; // 待发送附件
+  let oauthSession = null; // ChatGPT OAuth 会话
 
   // ---------- 工具 ----------
   const $ = (id) => document.getElementById(id);
@@ -60,6 +63,25 @@
     const b = $("messages");
     b.scrollTop = b.scrollHeight;
   }
+  function fmtSize(n) {
+    n = n || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1024 / 1024).toFixed(1) + " MB";
+  }
+  function fileIcon(name) {
+    const ext = (name || "").split(".").pop().toLowerCase();
+    if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"].includes(ext)) return "🖼";
+    if (["txt", "md"].includes(ext)) return "📄";
+    if (["json", "csv", "tsv"].includes(ext)) return "📊";
+    if (["py", "js", "ts", "rs", "go", "java", "c", "cpp", "html", "css"].includes(ext)) return "📜";
+    return "📎";
+  }
+  const IMAGE_MODEL_RE =
+    /image|dall-e|flux|gpt-image|nano-banana|imagen|midjourney|stable-diffusion|cogview|kolors|seedream|recraft|ideogram|janus/i;
+  function modelLooksLikeImage(m) {
+    return !!m && IMAGE_MODEL_RE.test(m);
+  }
 
   // ---------- 初始化 ----------
   async function init() {
@@ -71,6 +93,7 @@
     renderAccountChip();
     bindUI();
     loadBuildInfo();
+    if (modelLooksLikeImage(curModel)) setImageMode(true);
     if (!curConv) await newChat();
   }
 
@@ -117,6 +140,7 @@
         saveMsg("assistant", full);
         streaming = false;
         $("send").classList.remove("hidden");
+        $("stop").classList.add("hidden");
         return;
       }
       if (d.error) {
@@ -135,6 +159,15 @@
     });
     listen("account_ok", (e) => {
       setChip(e.payload.account, "ok");
+    });
+    // 书签脚本 / OAuth 登录成功后，若抓取弹窗开着则自动收尾
+    listen("login-captured", (e) => {
+      const d = e.payload || {};
+      toast(`已添加账号：${d.account || ""}`, "ok");
+      if (capturePid && d.provider === capturePid) {
+        closeCapture();
+        refreshCfg().then(() => renderAccounts(capturePid));
+      }
     });
   }
 
@@ -220,11 +253,15 @@
   async function selectConv(id) {
     curConv = id;
     const c = await invoke("get-conversation", { id });
-    curMessages = (c.messages || []).map((m) => ({ role: m.role, content: m.content }));
+    curMessages = (c.messages || []).map((m) => ({
+      role: m.role,
+      content: m.content,
+      attachments: m.attachments || [],
+    }));
     renderConvs();
     const box = $("messages");
     box.innerHTML = "";
-    curMessages.forEach((m) => appendMsgEl(m.role, m.content, false));
+    curMessages.forEach((m) => appendMsgEl(m.role, m.content, false, m.attachments));
     scrollBottom();
   }
   async function deleteConv(id) {
@@ -246,21 +283,43 @@
     await invoke("rename-conversation", { id, title: t });
     await loadConvs();
   }
-  function appendMsgEl(role, content, live) {
+  function attachChipsHtml(attachments) {
+    if (!attachments || !attachments.length) return "";
+    const chips = attachments
+      .map((a) => {
+        if (a.kind === "image" && a.url) {
+          return `<span class="att-chip img" title="${escapeHtml(a.name)}（${fmtSize(a.size)}）">
+            <img src="${escapeHtml(a.url)}" alt="${escapeHtml(a.name)}">
+          </span>`;
+        }
+        return `<span class="att-chip" title="${escapeHtml(a.name)}（${fmtSize(a.size)}）">
+          <span class="ic">${fileIcon(a.name)}</span>${escapeHtml(a.name)}
+        </span>`;
+      })
+      .join("");
+    return `<div class="att-row">${chips}</div>`;
+  }
+
+  function appendMsgEl(role, content, live, attachments) {
     const box = $("messages");
     const m = el(
       `<div class="msg ${role} ${live ? "live" : ""}" ${live ? 'data-live="1"' : ""}>
         <div class="av">${role === "user" ? "我" : "AI"}</div>
-        <div class="body">${renderMd(content)}</div>
+        <div class="body">${attachChipsHtml(attachments)}${renderMd(content)}</div>
       </div>`
     );
     box.appendChild(m);
     scrollBottom();
     return m;
   }
-  function saveMsg(role, content) {
+  function saveMsg(role, content, attachments) {
     if (!curConv) return;
-    invoke("save-message", { id: curConv, role, content }).catch(() => {});
+    invoke("save-message", {
+      id: curConv,
+      role,
+      content,
+      attachments: attachments || [],
+    }).catch(() => {});
   }
 
   // ---------- 发送 ----------
@@ -268,34 +327,117 @@
     if (streaming) return;
     const input = $("input");
     const text = input.value.trim();
-    if (!text) return;
+    if (!text && pendingAttachments.length === 0) return;
     if (!curConv) await newChat();
 
-    appendMsgEl("user", text, false);
-    curMessages.push({ role: "user", content: text });
-    saveMsg("user", text);
+    const attachments = pendingAttachments.slice();
+    appendMsgEl("user", text, false, attachments);
+    curMessages.push({ role: "user", content: text, attachments });
+    saveMsg("user", text, attachments);
     input.value = "";
+    input.style.height = "auto";
+    clearAttachments();
 
     const live = appendMsgEl("assistant", "", true);
     live.querySelector(".body").dataset.full = "";
     streaming = true;
     $("send").classList.add("hidden");
+    $("stop").classList.remove("hidden");
 
-    const p = curProvider();
     try {
       await invoke("chat-stream", {
         provider_id: curProviderId,
         model: curModel,
-        messages: curMessages.map((m) => ({ role: m.role, content: m.content })),
+        messages: curMessages.map((m) => ({
+          role: m.role,
+          content: m.content,
+          attachments: m.attachments || [],
+        })),
         conv_id: curConv,
+        image_mode: imageMode,
       });
     } catch (e) {
       const node = document.querySelector('.msg.assistant[data-live="1"] .body');
       if (node) node.innerHTML += `<p class="err">${escapeHtml(e)}</p>`;
       streaming = false;
       $("send").classList.remove("hidden");
+      $("stop").classList.add("hidden");
       toast("请求失败：" + e, "err");
     }
+  }
+
+  function stopStreaming() {
+    if (!streaming || !curConv) return;
+    invoke("chat-stop", { conv_id: curConv }).catch(() => {});
+  }
+
+  /** 🎨 生图开关：把本次发送当作绘图提示词。 */
+  function setImageMode(on) {
+    imageMode = on;
+    const btn = $("imgToggle");
+    btn.classList.toggle("active", on);
+    btn.title = on
+      ? "生图模式已开启：本条消息将作为绘图提示词"
+      : "生图模式：把本次发送当作绘图提示词";
+    const input = $("input");
+    input.placeholder = on
+      ? "描述你想画的图…  (Enter 生图 / Shift+Enter 换行)"
+      : "给 AI 发消息…  (Enter 发送 / Shift+Enter 换行)";
+  }
+
+  // ---------- 附件（上传 / 拖拽） ----------
+  async function uploadFiles(fileList) {
+    for (const f of Array.from(fileList)) {
+      if (pendingAttachments.length >= 8) {
+        toast("一次最多带 8 个附件", "warn");
+        break;
+      }
+      try {
+        const bytes = await f.arrayBuffer();
+        const saved = await TAURI.core.uploadFile(f.name, f.type, bytes);
+        pendingAttachments.push({
+          kind: saved.kind,
+          name: saved.name,
+          mime: saved.mime,
+          size: saved.size,
+          path: saved.id,
+          text: saved.text || null,
+          url: saved.url,
+        });
+      } catch (e) {
+        toast(`上传失败：${f.name} → ${e}`, "err");
+      }
+    }
+    renderAttachTray();
+  }
+  function renderAttachTray() {
+    const tray = $("attachTray");
+    if (pendingAttachments.length === 0) {
+      tray.classList.add("hidden");
+      tray.innerHTML = "";
+      return;
+    }
+    tray.classList.remove("hidden");
+    tray.innerHTML = "";
+    pendingAttachments.forEach((a, i) => {
+      const chip = el(
+        `<span class="att-chip pend" title="${escapeHtml(a.name)}">
+          <span class="ic">${a.kind === "image" ? "🖼" : fileIcon(a.name)}</span>
+          ${escapeHtml(a.name)}
+          <span class="sz">${fmtSize(a.size)}</span>
+          <span class="rm" title="移除">✕</span>
+        </span>`
+      );
+      chip.querySelector(".rm").onclick = () => {
+        pendingAttachments.splice(i, 1);
+        renderAttachTray();
+      };
+      tray.appendChild(chip);
+    });
+  }
+  function clearAttachments() {
+    pendingAttachments = [];
+    renderAttachTray();
   }
 
   // ---------- 设置 / 账号池 ----------
@@ -317,6 +459,41 @@
         openai: "OpenAI 兼容接口",
       }[ptype] || ptype
     );
+  }
+
+  // 接入方式选项：按服务族给出可选协议
+  function ptypeOptions(p) {
+    if (p.id === "chatgpt") {
+      return [
+        ["chatgpt_web", "ChatGPT 网页版（OAuth 登录 / 逆向）"],
+        ["openai", "OpenAI 兼容（官方 API / 反代）"],
+      ];
+    }
+    if (p.id === "claude") {
+      return [
+        ["claude_web", "Claude 网页版（sessionKey）"],
+        ["openai", "OpenAI 兼容（反代）"],
+      ];
+    }
+    if (p.id === "gemini") {
+      return [
+        ["gemini_native", "Gemini 官方原生协议"],
+        ["openai", "OpenAI 兼容层（反代）"],
+      ];
+    }
+    return [["openai", "OpenAI 兼容（官方 API / 反代）"]];
+  }
+  // 切换接入方式时的默认 Base URL
+  function defaultBaseFor(id, ptype) {
+    if (ptype === "openai") {
+      if (id === "chatgpt") return "https://api.openai.com/v1";
+      if (id === "gemini") return "https://generativelanguage.googleapis.com/v1beta/openai";
+      return "";
+    }
+    if (ptype === "gemini_native") return "https://generativelanguage.googleapis.com/v1beta";
+    if (ptype === "chatgpt_web") return "https://chatgpt.com";
+    if (ptype === "claude_web") return "https://claude.ai/api";
+    return "";
   }
 
   function renderProviderCards() {
@@ -344,6 +521,15 @@
           <h4>${escapeHtml(p.name)} ${p.enabled ? "" : "（已停用）"}
             <span class="pill">${escapeHtml(protoLabel(p.ptype))}</span></h4>
           <div class="row">
+            <div class="field"><label>接入方式</label>
+              <select data-f="ptype">
+                ${ptypeOptions(p)
+                  .map(
+                    ([v, label]) =>
+                      `<option value="${v}" ${v === p.ptype ? "selected" : ""}>${escapeHtml(label)}</option>`
+                  )
+                  .join("")}
+              </select></div>
             <div class="field"><label>${urlLabel}</label>
               <input data-f="base_url" value="${escapeHtml(p.base_url)}"></div>
             ${loginField}
@@ -372,6 +558,31 @@
           else prov[f] = inp.value;
         });
       });
+      const ptypeSel = card.querySelector('select[data-f="ptype"]');
+      if (ptypeSel) {
+        ptypeSel.addEventListener("change", () => {
+          const prov = cfg.providers.find((x) => x.id === p.id);
+          const next = ptypeSel.value;
+          prov.ptype = next;
+          // 切到 openai/gemini 时，若当前 base 明显是站点根地址则换成合理默认值
+          const looksLikeSiteRoot =
+            !prov.base_url.includes("/v1") &&
+            (prov.base_url.includes("chatgpt.com") ||
+              prov.base_url.includes("claude.ai") ||
+              prov.base_url === "" ||
+              prov.base_url.includes("your-proxy"));
+          if (looksLikeSiteRoot) {
+            const nb = defaultBaseFor(p.id, next);
+            if (nb) prov.base_url = nb;
+          }
+          if (next === "gemini_native") {
+            prov.base_url = "https://generativelanguage.googleapis.com/v1beta";
+          }
+          renderProviderCards();
+          renderAccounts($("acctProviderSel").value);
+          toast(`「${prov.name}」已切换为：${protoLabel(next)}，别忘了点保存`);
+        });
+      }
       const del = card.querySelector(".del-prov");
       if (del)
         del.onclick = () => {
@@ -396,11 +607,12 @@
     box.innerHTML = "";
     if (!p) return;
 
-    // 按钮文案跟随端点类型：Key 类显示「添加 API Key」，网页版显示「网页登录抓 Token」
+    // 按钮按端点类型只显示一个（已知问题 2：网页版与 Key 类不再弹同一个窗）
     const isWebProvider = p.ptype === "chatgpt_web" || p.ptype === "claude_web";
     const loginBtn = $("webLoginBtn");
     loginBtn.textContent = isWebProvider ? "🌐 网页登录抓 Token" : "＋ 添加 API Key";
-    $("keyAddBtn").classList.toggle("hidden", !isWebProvider);
+    loginBtn.classList.toggle("hidden", false);
+    $("keyAddBtn").classList.toggle("hidden", isWebProvider);
 
     const list = [...p.accounts].sort((a, b) => a.priority - b.priority);
     if (list.length === 0) {
@@ -608,24 +820,45 @@
   }
 
   // ---------- 网页登录抓取 ----------
-  const CHATGPT_BOOKMARKLET =
-    "javascript:(async()=>{try{const r=await fetch('/api/auth/session',{credentials:'include'});" +
-    "const j=await r.json();if(!j||!j.accessToken){alert('未登录或已过期，请先在 chatgpt.com 登录');return;}" +
-    "const data=JSON.stringify({token:j.accessToken,cookie:document.cookie,email:(j.user&&j.user.email)||''});" +
-    "await navigator.clipboard.writeText(data);alert('已复制登录信息，回到 AI Hub 粘贴即可');}" +
-    "catch(e){alert('抓取失败: '+e);}})()";
+  /** 书签脚本 v2：在 chatgpt.com 页面里直接 POST 回本地服务，无需手动粘贴。
+   *  端口动态取当前页面 origin，因此随机/固定端口都能用。 */
+  function bookmarkletSrc() {
+    const origin = location.origin;
+    return (
+      "javascript:(async()=>{try{" +
+      "const r=await fetch('/api/auth/session',{credentials:'include'});" +
+      "const j=await r.json();" +
+      "if(!j||!j.accessToken){alert('未登录或已过期，请先在 chatgpt.com 登录');return;}" +
+      "const data={provider_id:'chatgpt',secret:j.accessToken,cookie:document.cookie,name:(j.user&&j.user.email)||''};" +
+      "const resp=await fetch('" +
+      origin +
+      "/api/capture-login-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});" +
+      "if(resp.ok){alert('已自动添加账号到 AI Hub，可以关闭本页');}" +
+      "else{alert('回传失败: HTTP '+resp.status);}}" +
+      "catch(e){alert('抓取失败: '+e);}})()"
+    );
+  }
 
   function openCapture(pid) {
     const p = cfg.providers.find((x) => x.id === pid);
     if (!p) return;
     capturePid = pid;
+    oauthSession = null;
     $("capInput").value = "";
     $("capCookie").value = "";
+    $("capOauthCallback").value = "";
+    $("capOauthHint").textContent = "授权页登录后会跳转到一个显示错误的页面，属正常现象，复制地址栏网址即可";
     $("capStatus").className = "cap-status";
     $("capStatus").textContent = "";
     const isClaude = p.ptype === "claude_web";
+    const isChatgpt = p.ptype === "chatgpt_web";
     $("capCookieWrap").classList.toggle("hidden", isClaude);
-    $("capTitle").textContent = isClaude ? "Claude 网页版登录" : "ChatGPT 网页版登录";
+    $("capOauthWrap").classList.toggle("hidden", !isChatgpt);
+    $("capTitle").textContent = isClaude
+      ? "Claude 网页版登录"
+      : isChatgpt
+      ? "ChatGPT 登录（OAuth 一键 / 书签自动抓取）"
+      : "抓取登录 Token";
 
     if (isClaude) {
       $("capInputLabel").textContent = "粘贴 sessionKey";
@@ -637,30 +870,77 @@
         "3. 找到名为 <code>sessionKey</code> 的行，复制其 <b>Value</b><br>" +
         "4. 粘贴到下方，点「验证并添加」<br>" +
         '<span style="opacity:.75">注：sessionKey 是 HttpOnly，脚本读不到，只能手动复制。</span>';
-    } else {
-      $("capInputLabel").textContent = "粘贴登录信息（书签脚本会自动复制 JSON）";
-      $("capInput").placeholder =
-        '{"token":"...","cookie":"...","email":"..."} 或直接粘贴 accessToken';
+    } else if (isChatgpt) {
+      $("capInputLabel").textContent = "或手动粘贴 accessToken（可选）";
+      $("capInput").placeholder = '{"token":"...","cookie":"..."} 或直接粘贴 accessToken';
+      const bm = bookmarkletSrc();
       $("capSteps").innerHTML =
-        "<b>获取 ChatGPT 的 accessToken：</b><br>" +
-        "1. 把下方按钮<b>拖到书签栏</b>（或右键复制链接存为书签）<br>" +
+        "<b>方式一 · OAuth 一键登录（推荐，可自动续期）</b><br>" +
+        "点上方「🔑 打开 OpenAI 授权页」→ 在浏览器里登录 → 把地址栏网址粘到下面 → 「完成登录」。<br><br>" +
+        "<b>方式二 · 书签自动抓取（零粘贴）</b><br>" +
+        "1. 把下方「AI Hub 抓取」按钮<b>拖到书签栏</b>（或复制脚本存为书签）<br>" +
         "2. 新标签打开 <code>chatgpt.com</code> 并登录<br>" +
-        "3. 点击该书签，会自动复制登录信息<br>" +
-        "4. 回到本页粘贴，点「验证并添加」<br>" +
+        "3. 点一下书签——脚本会自动把 Token 回传到本机 AI Hub，页面会提示「已添加账号」<br><br>" +
+        '<b>方式三 · 手动粘贴</b>（前两种都失败时再用）<br>" +
         '<div class="bm"><a href="' +
-        CHATGPT_BOOKMARKLET.replace(/"/g, "&quot;") +
+        bm.replace(/"/g, "&quot;") +
         '" onclick="return false;">AI Hub 抓取</a>' +
         '<button class="ghost sm" id="capCopyBm">复制脚本</button></div>';
+    } else {
+      $("capInputLabel").textContent = "粘贴 Token";
+      $("capInput").placeholder = "";
+      $("capSteps").innerHTML = "把登录态 Token 粘贴到下方，点「验证并添加」。";
     }
     $("captureModal").classList.remove("hidden");
     const cp = $("capCopyBm");
     if (cp)
       cp.onclick = () => {
-        navigator.clipboard.writeText(CHATGPT_BOOKMARKLET).then(
+        navigator.clipboard.writeText(bookmarkletSrc()).then(
           () => toast("脚本已复制，可存为书签"),
           () => toast("复制失败，请手动拖拽按钮", "warn")
         );
       };
+  }
+
+  // ---------- ChatGPT OAuth ----------
+  async function capOauthStart() {
+    if (!capturePid) return;
+    try {
+      const r = await invoke("oauth-start", { email_hint: "" });
+      oauthSession = r.session_id;
+      window.open(r.authorize_url, "_blank", "noopener");
+      $("capOauthHint").textContent =
+        "已打开授权页：登录完成后，把浏览器地址栏里的完整网址粘贴到下方，点「完成登录」";
+      setTimeout(() => {
+        const t = $("capOauthCallback");
+        if (t) t.focus();
+      }, 400);
+    } catch (e) {
+      toast("启动 OAuth 失败：" + e, "err");
+    }
+  }
+
+  async function capOauthFinish() {
+    const cb = ($("capOauthCallback").value || "").trim();
+    if (!oauthSession) {
+      toast("请先点「打开 OpenAI 授权页」", "warn");
+      return;
+    }
+    if (!cb) {
+      toast("请粘贴授权完成后浏览器地址栏的完整网址", "warn");
+      return;
+    }
+    const btn = $("capOauthFinish");
+    btn.disabled = true;
+    btn.textContent = "登录中…";
+    try {
+      await invoke("oauth-finish", { session_id: oauthSession, callback: cb });
+      // 成功后后端会推 login-captured 事件，弹窗自动关闭
+    } catch (e) {
+      toast("OAuth 登录失败：" + e, "err");
+      btn.disabled = false;
+      btn.textContent = "完成登录";
+    }
   }
 
   function closeCapture() {
@@ -882,9 +1162,45 @@
       renderModels();
       renderAccountChip();
     };
-    $("modelSel").onchange = (e) => (curModel = e.target.value);
+    $("modelSel").onchange = (e) => {
+      curModel = e.target.value;
+      // 模型名命中生图模型时自动打开 🎨（仍可手动关掉）
+      if (modelLooksLikeImage(curModel) && !imageMode) setImageMode(true);
+    };
 
     $("send").onclick = send;
+    $("stop").onclick = stopStreaming;
+
+    // 🎨 生图开关
+    $("imgToggle").onclick = () => setImageMode(!imageMode);
+
+    // 📎 上传
+    $("attachBtn").onclick = () => $("fileInput").click();
+    $("fileInput").addEventListener("change", () => {
+      if ($("fileInput").files && $("fileInput").files.length) {
+        uploadFiles($("fileInput").files);
+        $("fileInput").value = "";
+      }
+    });
+    // 拖拽上传（整个主区域）
+    const main = $("main");
+    ["dragover", "drop"].forEach((ev) =>
+      main.addEventListener(ev, (e) => {
+        e.preventDefault();
+        if (ev === "dragover") main.classList.add("drag");
+        else {
+          main.classList.remove("drag");
+          if (e.dataTransfer && e.dataTransfer.files.length) {
+            uploadFiles(e.dataTransfer.files);
+          }
+        }
+      })
+    );
+    main.addEventListener("dragleave", () => main.classList.remove("drag"));
+
+    // ChatGPT OAuth 按钮
+    $("capOauthStart").onclick = capOauthStart;
+    $("capOauthFinish").onclick = capOauthFinish;
     const input = $("input");
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
