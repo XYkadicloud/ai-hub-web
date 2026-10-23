@@ -175,6 +175,9 @@
         const errHtml = d.error ? `<p class="err">${escapeHtml(d.error)}</p>` : "";
         live.removeAttribute("data-live");
         node.innerHTML = renderMd(full) + errHtml;
+        // 流结束后把「思考过程」折叠起来，避免占屏
+        const rb = live.querySelector(".reasoning");
+        if (rb) rb.removeAttribute("open");
         saveMsg("assistant", full);
         streaming = false;
         $("send").classList.remove("hidden");
@@ -188,6 +191,23 @@
       const full = (node.dataset.full || "") + d.delta;
       node.dataset.full = full;
       node.innerHTML = renderMd(full) + '<span class="caret">▍</span>';
+      scrollBottom();
+    });
+    listen("chat_reasoning", (e) => {
+      const d = e.payload;
+      if (d.conv_id !== curConv) return;
+      const live = document.querySelector('.msg.assistant[data-live="1"]');
+      if (!live) return;
+      let box = live.querySelector(".reasoning");
+      if (!box) {
+        box = el(
+          '<details class="reasoning" open><summary>思考过程</summary><div class="rbody"></div></details>'
+        );
+        live.insertBefore(box, live.querySelector(".body"));
+      }
+      const rb = box.querySelector(".rbody");
+      rb.textContent += d.delta;
+      rb.scrollTop = rb.scrollHeight;
       scrollBottom();
     });
     listen("account_switch", (e) => {
@@ -579,7 +599,9 @@
             <div class="field"><label>代理 proxy（可选）</label>
               <input data-f="proxy" value="${escapeHtml(p.proxy || "")}" placeholder="http://127.0.0.1:7890"></div>
           </div>
-          <div class="field"><label>模型列表（逗号分隔）</label>
+          <div class="field"><label>模型列表（逗号分隔）
+            <button class="ghost sm fetch-models" data-pid="${p.id}" title="调用 {base}/models 自动填充">拉取模型</button>
+          </label>
             <input data-f="models" value="${escapeHtml(p.models.join(", "))}"></div>
           ${selectorField}
           <div class="prov-actions">
@@ -598,6 +620,38 @@
         });
       });
       const ptypeSel = card.querySelector('select[data-f="ptype"]');
+      const fetchBtn = card.querySelector(".fetch-models");
+      if (fetchBtn) {
+        fetchBtn.onclick = async (ev) => {
+          ev.preventDefault();
+          const old = fetchBtn.textContent;
+          fetchBtn.disabled = true;
+          fetchBtn.textContent = "拉取中…";
+          try {
+            const r = await invoke("list-models", { provider_id: p.id });
+            const models = (r && r.models) || [];
+            if (!models.length) {
+              toast("该端点没有返回模型列表", "warn");
+              return;
+            }
+            const prov = cfg.providers.find((x) => x.id === p.id);
+            prov.models = models;
+            if (!prov.default_model || models.indexOf(prov.default_model) < 0) {
+              prov.default_model = models[0];
+            }
+            const mi = card.querySelector('input[data-f="models"]');
+            if (mi) mi.value = models.join(", ");
+            const dm = card.querySelector('input[data-f="default_model"]');
+            if (dm) dm.value = prov.default_model;
+            toast(`已拉取 ${models.length} 个模型`, "ok");
+          } catch (e) {
+            toast("拉取模型失败：" + e, "err");
+          } finally {
+            fetchBtn.disabled = false;
+            fetchBtn.textContent = old;
+          }
+        };
+      }
       if (ptypeSel) {
         ptypeSel.addEventListener("change", () => {
           const prov = cfg.providers.find((x) => x.id === p.id);

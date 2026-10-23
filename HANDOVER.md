@@ -231,8 +231,30 @@ Auth0 给 Codex 这个公开客户端注册了 **loopback 回调**（任意 loca
 `scope = openid profile email offline_access api.connectors.read api.connectors.invoke`，
 附加 `codex_cli_simplified_flow=true&id_token_add_organizations=true&originator=codex_cli_rs`。
 
+> **PKCE 算法必须是 SHA-256**（`code_challenge_method=S256` 的 S256 指 SHA-256，
+> 不是 SHA3-256）。用错算法时授权页照样能过，但换 token 会被 OpenAI 拒绝并返回
+> `token_exchange_user_error`，极难排查。`oauth::tests::pkce_challenge_matches_rfc7636`
+> 用 RFC 7636 附录 B 的测试向量守住这一点。
+>
 > 若 loopback 因防火墙/代理被拦，弹窗里还有「自动登录失败？手动完成」折叠区：
 > 把回调页地址栏 URL 粘进去点「手动完成登录」，走 `POST /api/oauth/finish` 兜底。
+
+### 6.3.1 `openai` —— 通用 OpenAI 兼容协议（主力通道）
+
+这是最通用的一条链路，DeepSeek / 各类中转 / 自建 vLLM / OneAPI 都走它。
+适配细节（都踩过坑）：
+
+| 问题 | 处理 |
+| --- | --- |
+| `base_url` 写 `https://x`、`https://x/v1`、`https://x/v1/` 都有人写 | `providers::chat_urls()` 生成候选列表，遇 404/405 自动换下一个候选 |
+| 部分网关用 CRLF 分帧 SSE | 收到 chunk 先 `replace("
+", "
+")` 再按空行切 |
+| 推理模型把思考过程放在 `delta.reasoning_content` | 单独解析成 `ChatEvent::Reasoning` → SSE `chat_reasoning` → 前端折叠块「思考过程」 |
+| 有的端点先回 200，再在流里塞 `{"error":...}` | 解析时识别并直接报错，不会静默变成空回复 |
+| 错误信息只有状态码，无法排查 | `classify_error` 提取 `error.message` 原文，按 400/401/402/403/404/422/429 分别给中文提示 |
+| 不知道模型名该填什么 | 设置页每个端点有「拉取模型」按钮 → `POST /api/models` → `GET {base}/models`（同样带 /v1 回退），自动填进模型列表 |
+| 推理模型不接受 `temperature` | 请求体不再硬塞 `temperature`，交给服务端默认值 |
 
 ### 6.4 `claude_web` —— Claude 网页版
 

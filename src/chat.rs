@@ -3,7 +3,7 @@ use crate::chat_attach::{
 };
 use crate::config::{load_config, mark_account_error, resolve_accounts, touch_account};
 use crate::files;
-use crate::providers::{build_client, chat_url};
+use crate::providers::{build_client, chat_urls};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -24,6 +24,8 @@ pub fn is_aborted(abort: &Option<AbortFlag>) -> bool {
 pub enum ChatEvent {
     /// 一段增量文本
     Delta(String),
+    /// 一段增量「思考过程」（DeepSeek R1 / Qwen / GLM 等推理模型的 reasoning_content）
+    Reasoning(String),
     /// 账号异常，已切换到下一个（携带账号名与原因）
     Switch { account: String, reason: String },
     /// 当前生效账号（成功建立连接时）
@@ -122,7 +124,12 @@ async fn run(
     let total = accounts.len();
 
     let client = build_client(&provider)?;
-    let url = chat_url(&provider);
+    // base_url 的写法各家不一（带不带 /v1、末尾有没有斜杠、有没有写全），
+    // 这里给出一组候选，遇到 404/405 就换下一个，用户不用纠结格式。
+    let urls = chat_urls(&provider);
+    if urls.is_empty() {
+        return Err("该服务的 Base URL 为空，请在设置里填写".into());
+    }
     let body = json!({
         "model": model,
         "messages": messages
@@ -133,7 +140,6 @@ async fn run(
             }))
             .collect::<Vec<_>>(),
         "stream": true,
-        "temperature": 0.7,
     });
 
     for acc in accounts {
@@ -141,64 +147,63 @@ async fn run(
             return Ok(());
         }
         let secret = acc.secret.trim();
-        let mut req = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if !secret.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", secret));
-        }
+        let mut last_reason = String::from("未知错误");
 
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    let pid = provider.id.clone();
-                    let aid = acc.id.clone();
-                    let aname = acc.name.clone();
-                    let _ = tx.send(ChatEvent::Active {
-                        account: aname.clone(),
-                    });
-                    match stream_response(resp, tx, abort).await {
-                        Ok(_) => {
-                            touch_account(dir, &pid, &aid);
-                            let _ = tx.send(ChatEvent::Done);
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            mark_account_error(dir, &pid, &aid, &e);
-                            let _ = tx.send(ChatEvent::Error(e.clone()));
-                            return Err(e);
+        for (idx, url) in urls.iter().enumerate() {
+            let mut req = client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .json(&body);
+            if !secret.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", secret));
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let pid = provider.id.clone();
+                        let aid = acc.id.clone();
+                        let _ = tx.send(ChatEvent::Active {
+                            account: acc.name.clone(),
+                        });
+                        match stream_response(resp, tx, abort).await {
+                            Ok(_) => {
+                                touch_account(dir, &pid, &aid);
+                                let _ = tx.send(ChatEvent::Done);
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                mark_account_error(dir, &pid, &aid, &e);
+                                let _ = tx.send(ChatEvent::Error(e.clone()));
+                                return Err(e);
+                            }
                         }
                     }
-                } else {
                     let code = status.as_u16();
                     let text = resp.text().await.unwrap_or_default();
-                    let reason = classify_error(code, &text);
-                    mark_account_error(dir, &provider.id, &acc.id, &reason);
-                    let _ = tx.send(ChatEvent::Switch {
-                        account: acc.name.clone(),
-                        reason: reason.clone(),
-                    });
-                    continue;
+                    // 端点路径不对（常见于漏写 /v1 或写多了 /v1）：换下一个候选
+                    if (code == 404 || code == 405) && idx + 1 < urls.len() {
+                        last_reason = format!("{} 不存在（HTTP {}）", url, code);
+                        continue;
+                    }
+                    last_reason = classify_error(code, &text);
+                    break;
+                }
+                Err(e) => {
+                    last_reason = format!("网络请求失败: {}", e);
+                    break;
                 }
             }
-            Err(e) => {
-                let reason = format!("网络请求失败: {}", e);
-                mark_account_error(dir, &provider.id, &acc.id, &reason);
-                let _ = tx.send(ChatEvent::Switch {
-                    account: acc.name.clone(),
-                    reason: reason.clone(),
-                });
-                continue;
-            }
         }
+
+        mark_account_error(dir, &provider.id, &acc.id, &last_reason);
+        let _ = tx.send(ChatEvent::Switch {
+            account: acc.name.clone(),
+            reason: last_reason,
+        });
     }
 
-    let _ = tx.send(ChatEvent::Error(format!(
-        "所有账号均不可用（已尝试 {} 个），请检查账号池或网络",
-        total
-    )));
     Err("所有账号均不可用".into())
 }
 
@@ -324,27 +329,24 @@ async fn stream_response(
             return Ok(());
         }
         let chunk = chunk.map_err(|e| format!("读取响应流失败: {}", e))?;
-        let text = String::from_utf8_lossy(&chunk);
+        // 有些网关/反代用 CRLF 分帧，统一成 LF 再按空行切事件
+        let text = String::from_utf8_lossy(&chunk).replace("\r\n", "\n");
         buf.push_str(&text);
         raw.push_str(&text);
         while let Some(idx) = buf.find("\n\n") {
             let event = buf[..idx].to_string();
             buf = buf[idx + 2..].to_string();
-            if let Some(delta) = parse_sse(&event) {
+            if handle_event(&event, tx) {
                 got_any = true;
-                let _ = tx.send(ChatEvent::Delta(delta));
             }
         }
     }
 
-    if !buf.trim().is_empty() {
-        if let Some(delta) = parse_sse(&buf) {
-            got_any = true;
-            let _ = tx.send(ChatEvent::Delta(delta));
-        }
+    if !buf.trim().is_empty() && handle_event(&buf, tx) {
+        got_any = true;
     }
 
-    // 兜底：非流式单条 JSON 响应
+    // 兜底：非流式单条 JSON 响应（部分兼容端点忽略 stream=true）
     if !got_any && !raw.trim().is_empty() {
         if let Some(content) = parse_completion(&raw) {
             let _ = tx.send(ChatEvent::Delta(content));
@@ -353,42 +355,81 @@ async fn stream_response(
     Ok(())
 }
 
-fn classify_error(code: u16, body: &str) -> String {
-    match code {
-        401 => "鉴权失败/账号登录已过期".into(),
-        403 => "账号被封禁或无权限访问".into(),
-        429 => "触发速率限制或额度已用尽".into(),
-        400 => format!("请求被拒: {}", body.chars().take(200).collect::<String>()),
-        _ => format!("HTTP {}: {}", code, body.chars().take(300).collect::<String>()),
-    }
-}
-
-fn parse_sse(event: &str) -> Option<String> {
-    let mut delta = String::new();
-    let mut done = false;
+/// 解析一个 SSE 事件块，把正文与思考过程分别推给前端。
+/// 返回是否产出了内容。
+fn handle_event(event: &str, tx: &mpsc::UnboundedSender<ChatEvent>) -> bool {
+    let mut got = false;
     for line in event.lines() {
         let line = line.trim();
-        if let Some(data) = line.strip_prefix("data:") {
-            let data = data.trim();
-            if data == "[DONE]" {
-                done = true;
-                continue;
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        // 有的端点先回 200，再在流里塞一个 error 对象
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or_else(|| "服务端返回错误");
+            let _ = tx.send(ChatEvent::Error(format!("服务端返回错误: {}", msg)));
+            return got;
+        }
+        if let Some(r) = extract_reasoning(&v) {
+            if !r.is_empty() {
+                let _ = tx.send(ChatEvent::Reasoning(r));
+                got = true;
             }
-            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                if let Some(d) = extract_content(&v) {
-                    delta.push_str(&d);
-                }
+        }
+        if let Some(c) = extract_content(&v) {
+            if !c.is_empty() {
+                let _ = tx.send(ChatEvent::Delta(c));
+                got = true;
             }
         }
     }
-    if done && delta.is_empty() {
-        return None;
+    got
+}
+
+fn classify_error(code: u16, body: &str) -> String {
+    // 尽量把服务端给的原因原样带出来，比只报状态码有用得多
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .or_else(|| v.get("message"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| body.chars().take(200).collect());
+    match code {
+        400 => format!("请求被拒（参数或模型名不对）：{}", detail),
+        401 => format!("鉴权失败，API Key 无效或已过期：{}", detail),
+        402 => format!("余额不足：{}", detail),
+        403 => format!("无权限访问该模型/接口：{}", detail),
+        404 => format!("接口或模型不存在：{}", detail),
+        422 => format!("参数校验失败：{}", detail),
+        429 => format!("触发限流或额度已用尽：{}", detail),
+        _ => format!("HTTP {}：{}", code, detail),
     }
-    if delta.is_empty() {
-        None
-    } else {
-        Some(delta)
+}
+
+fn extract_reasoning(v: &Value) -> Option<String> {
+    let first = v.get("choices")?.as_array()?.get(0)?;
+    for key in ["reasoning_content", "reasoning", "thinking"] {
+        if let Some(r) = first.get("delta").and_then(|d| d.get(key)).and_then(|c| c.as_str()) {
+            return Some(r.to_string());
+        }
+        if let Some(r) = first.get("message").and_then(|d| d.get(key)).and_then(|c| c.as_str()) {
+            return Some(r.to_string());
+        }
     }
+    None
 }
 
 fn extract_content(v: &Value) -> Option<String> {

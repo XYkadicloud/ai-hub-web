@@ -25,7 +25,7 @@ use base64::Engine;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha3::{Digest, Sha3_256};
+use sha2::{Digest as _, Sha256};
 
 const AUTH_BASE: &str = "https://auth.openai.com";
 const PLATFORM_BASE: &str = "https://platform.openai.com";
@@ -58,11 +58,16 @@ pub struct PendingOAuth {
 }
 
 /// 生成 PKCE 对：返回 (code_verifier, code_challenge)。
+/// 生成 PKCE 对：返回 (code_verifier, code_challenge)。
+///
+/// **注意**：`code_challenge_method=S256` 指的是 **SHA-256**，
+/// 不是 SHA3-256（SHA3 是 PoW 那边用的）。用错算法时授权页照样能过，
+/// 但换 token 会被 OpenAI 拒绝（`token_exchange_user_error`），很难排查。
 pub fn generate_pkce() -> (String, String) {
     let mut bytes = [0u8; 64];
     rand::thread_rng().fill_bytes(&mut bytes);
     let verifier = URL_SAFE_NO_PAD.encode(bytes);
-    let mut h = Sha3_256::new();
+    let mut h = Sha256::new();
     h.update(verifier.as_bytes());
     let challenge = URL_SAFE_NO_PAD.encode(h.finalize());
     (verifier, challenge)
@@ -406,4 +411,38 @@ pub fn uuid_v4() -> String {
         h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
         h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 7636 附录 B 的标准测试向量：挑战值必须等于
+    /// BASE64URL(SHA256(verifier))，用来防止有人把算法换成 SHA3。
+    #[test]
+    fn pkce_challenge_matches_rfc7636() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let mut h = Sha256::new();
+        h.update(verifier.as_bytes());
+        let challenge = URL_SAFE_NO_PAD.encode(h.finalize());
+        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn pkce_generated_pair_is_consistent() {
+        let (v, c) = generate_pkce();
+        assert!(v.len() >= 43 && v.len() <= 128);
+        let mut h = Sha256::new();
+        h.update(v.as_bytes());
+        assert_eq!(c, URL_SAFE_NO_PAD.encode(h.finalize()));
+    }
+
+    #[test]
+    fn extract_callback_parses_loopback_url() {
+        let url = "http://127.0.0.1:25880/auth/callback?code=abc123&state=sid.nonce";
+        let (code, state, base) = extract_callback(url).unwrap();
+        assert_eq!(code, "abc123");
+        assert_eq!(state, "sid.nonce");
+        assert_eq!(base, "http://127.0.0.1:25880/auth/callback");
+    }
 }

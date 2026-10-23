@@ -82,6 +82,15 @@
               };
               hasBody = true;
               break;
+            case "list-models":
+              method = "POST";
+              url = "/api/models";
+              body = {
+                provider_id: pick(args.provider_id, args.providerId),
+                secret: args.secret,
+              };
+              hasBody = true;
+              break;
             case "chat-stream":
               method = "POST";
               url = "/api/chat";

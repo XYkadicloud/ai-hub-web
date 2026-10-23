@@ -411,35 +411,49 @@ async fn list_models(
     } else if p.ptype == "chatgpt_web" || p.ptype == "claude_web" {
         return Ok(Json(json!({ "models": p.models })));
     } else {
-        let base = p.base_url.trim().trim_end_matches('/');
         let client = crate::providers::build_client(p)?;
-        let resp = client
-            .get(format!("{}/models", base))
-            .header("Authorization", format!("Bearer {}", key))
-            .send()
-            .await
-            .map_err(|e| AppErr(format!("网络请求失败: {}", e)))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(AppErr(format!(
-                "HTTP {}：{}",
-                status.as_u16(),
-                text.chars().take(200).collect::<String>()
-            )));
+        // base_url 可能带/不带 /v1，两个候选都试一遍
+        let mut last_err = String::from("无法获取模型列表");
+        let mut found: Option<Vec<String>> = None;
+        for url in crate::providers::models_urls(p) {
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", key))
+                .send()
+                .await
+                .map_err(|e| AppErr(format!("网络请求失败: {}", e)))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                last_err = format!(
+                    "HTTP {}：{}",
+                    status.as_u16(),
+                    text.chars().take(200).collect::<String>()
+                );
+                continue;
+            }
+            let v: Value = serde_json::from_str(&text).map_err(|e| AppErr(e.to_string()))?;
+            let mut ids: Vec<String> = v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            ids.sort();
+            if ids.is_empty() {
+                last_err = format!("{} 的返回里没有 data[].id", url);
+                continue;
+            }
+            found = Some(ids);
+            break;
         }
-        let v: Value = serde_json::from_str(&text).map_err(|e| AppErr(e.to_string()))?;
-        let mut ids: Vec<String> = v
-            .get("data")
-            .and_then(|d| d.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        ids.sort();
-        Ok(ids)
+        match found {
+            Some(ids) => Ok(ids),
+            None => Err(last_err),
+        }
     };
 
     match res {
@@ -501,6 +515,10 @@ async fn chat(State(s): State<AppState>, Json(b): Json<ChatBody>) -> Result<Json
                 ChatEvent::Delta(d) => (
                     "chat_stream",
                     json!({"conv_id": conv_id, "delta": d, "done": false, "error": null}),
+                ),
+                ChatEvent::Reasoning(r) => (
+                    "chat_reasoning",
+                    json!({"conv_id": conv_id, "delta": r}),
                 ),
                 ChatEvent::Active { account } => ("account_ok", json!({"account": account})),
                 ChatEvent::Switch { account, reason } => {
