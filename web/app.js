@@ -85,16 +85,28 @@
 
   // ---------- 初始化 ----------
   async function init() {
-    await loadConfig();
-    setupListeners();
-    await loadConvs();
-    renderProviders();
-    renderModels();
-    renderAccountChip();
-    bindUI();
-    loadBuildInfo();
-    if (modelLooksLikeImage(curModel)) setImageMode(true);
-    if (!curConv) await newChat();
+    // 防重入：DOMContentLoaded 与脚本兜底调用可能重复触发，
+    // 重复 init 会在服务端建出两个空会话。
+    if (window.__hubInitDone) return;
+    window.__hubInitDone = true;
+    try {
+      await loadConfig();
+      setupListeners();
+      await loadConvs();
+      renderProviders();
+      renderModels();
+      renderAccountChip();
+      bindUI();
+      loadBuildInfo();
+      if (modelLooksLikeImage(curModel)) setImageMode(true);
+      if (!curConv) await newChat();
+    } catch (e) {
+      // 任何一步失败都给出可见错误，绝不留一个「点不动的死壳」
+      const msg = String((e && e.message) || e);
+      $("fatalMsg").textContent = msg;
+      $("fatalBar").classList.remove("hidden");
+      console.error("AI Hub 初始化失败:", e);
+    }
   }
 
   /** 显示构建信息，方便核对 exe 是否最新（Tauri 版无此接口，静默跳过）。 */
@@ -102,15 +114,41 @@
     try {
       const v = await fetch("/api/version").then((r) => r.json());
       const box = $("buildInfo");
-      if (!box) return;
-      const d = new Date((v.build_ts || 0) * 1000);
-      const p2 = (n) => String(n).padStart(2, "0");
-      box.textContent =
-        `v${v.version} · ${v.mode} · 构建 ` +
-        `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ` +
-        `${p2(d.getHours())}:${p2(d.getMinutes())}`;
+      if (box) {
+        const d = new Date((v.build_ts || 0) * 1000);
+        const p2 = (n) => String(n).padStart(2, "0");
+        box.textContent =
+          `v${v.version} · ${v.mode} · 端口 ${location.port} · 构建 ` +
+          `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ` +
+          `${p2(d.getHours())}:${p2(d.getMinutes())}`;
+      }
+      const dir = $("dataDirInfo");
+      if (dir && v.data_dir) {
+        dir.textContent = "📁 " + v.data_dir;
+        dir.title = "数据目录（点击复制路径）";
+        dir.onclick = () => {
+          navigator.clipboard.writeText(v.data_dir).then(
+            () => toast("数据目录路径已复制"),
+            () => toast("复制失败", "warn")
+          );
+        };
+      }
     } catch (e) {
       /* 非浏览器版（Tauri）没有该接口，忽略 */
+    }
+  }
+
+  // ---------- 日志查看 ----------
+  async function openLog() {
+    $("logModal").classList.remove("hidden");
+    await refreshLog();
+  }
+  async function refreshLog() {
+    try {
+      const r = await fetch("/api/log").then((x) => x.json());
+      $("logText").textContent = r.log || "（暂无日志）";
+    } catch (e) {
+      $("logText").textContent = "读取日志失败：" + e;
     }
   }
 
@@ -164,9 +202,10 @@
     listen("login-captured", (e) => {
       const d = e.payload || {};
       toast(`已添加账号：${d.account || ""}`, "ok");
-      if (capturePid && d.provider === capturePid) {
+      const pid = capturePid;
+      if (pid && d.provider === pid) {
         closeCapture();
-        refreshCfg().then(() => renderAccounts(capturePid));
+        refreshCfg().then(() => renderAccounts(pid));
       }
     });
   }
@@ -847,41 +886,55 @@
     $("capInput").value = "";
     $("capCookie").value = "";
     $("capOauthCallback").value = "";
-    $("capOauthHint").textContent = "授权页登录后会跳转到一个显示错误的页面，属正常现象，复制地址栏网址即可";
+    $("capOauthHint").textContent =
+      "点一下 → 浏览器里登录 → 自动回到这里，无需复制任何东西";
+    const ob = $("capOauthStart");
+    if (ob) {
+      ob.disabled = false;
+      ob.textContent = "🔑 一键登录 ChatGPT";
+    }
     $("capStatus").className = "cap-status";
     $("capStatus").textContent = "";
     const isClaude = p.ptype === "claude_web";
     const isChatgpt = p.ptype === "chatgpt_web";
-    $("capCookieWrap").classList.toggle("hidden", isClaude);
+    $("capCookieWrap").classList.remove("hidden");
     $("capOauthWrap").classList.toggle("hidden", !isChatgpt);
+    $("capCookieLabel").textContent = isClaude
+      ? "完整 Cookie（强烈建议粘贴，否则容易被风控）"
+      : "Cookie（可选，推荐一并粘贴以提高成功率）";
+    $("capCookie").placeholder = isClaude
+      ? "从 claude.ai 复制整条 Cookie（含 cf_clearance / __cf_bm / sessionKey），能显著降低 403 风控"
+      : "从浏览器复制的完整 Cookie";
     $("capTitle").textContent = isClaude
       ? "Claude 网页版登录"
       : isChatgpt
-      ? "ChatGPT 登录（OAuth 一键 / 书签自动抓取）"
+      ? "ChatGPT 登录（一键 OAuth）"
       : "抓取登录 Token";
 
     if (isClaude) {
       $("capInputLabel").textContent = "粘贴 sessionKey";
       $("capInput").placeholder = "从 claude.ai 的 Cookie 中复制 sessionKey 的值";
       $("capSteps").innerHTML =
-        "<b>获取 Claude 的 sessionKey：</b><br>" +
+        "<b>获取 Claude 的登录态：</b><br>" +
         "1. 新标签打开 <code>claude.ai</code> 并登录<br>" +
         "2. 按 <code>F12</code> → <b>Application（应用）</b> → <b>Cookies</b> → <code>https://claude.ai</code><br>" +
-        "3. 找到名为 <code>sessionKey</code> 的行，复制其 <b>Value</b><br>" +
-        "4. 粘贴到下方，点「验证并添加」<br>" +
+        "3. 找到 <code>sessionKey</code>，复制其 <b>Value</b> 填到下面<br>" +
+        "4. <b>强烈建议</b>：把该站点下<b>所有 Cookie 整条</b>（含 <code>cf_clearance</code>、<code>__cf_bm</code>）粘到「完整 Cookie」里——" +
+        "Claude 用 Cloudflare 防护，只带 sessionKey 很容易被 403 风控<br>" +
+        "5. 点「验证并添加」<br>" +
         '<span style="opacity:.75">注：sessionKey 是 HttpOnly，脚本读不到，只能手动复制。</span>';
     } else if (isChatgpt) {
       $("capInputLabel").textContent = "或手动粘贴 accessToken（可选）";
       $("capInput").placeholder = '{"token":"...","cookie":"..."} 或直接粘贴 accessToken';
       const bm = bookmarkletSrc();
       $("capSteps").innerHTML =
-        "<b>方式一 · OAuth 一键登录（推荐，可自动续期）</b><br>" +
-        "点上方「🔑 打开 OpenAI 授权页」→ 在浏览器里登录 → 把地址栏网址粘到下面 → 「完成登录」。<br><br>" +
+        "<b>方式一 · 一键 OAuth 登录（推荐，可自动续期）</b><br>" +
+        "点上方「🔑 一键登录 ChatGPT」→ 在打开的页面里登录 → 登录完会自动回到这里并加好账号。<br><br>" +
         "<b>方式二 · 书签自动抓取（零粘贴）</b><br>" +
         "1. 把下方「AI Hub 抓取」按钮<b>拖到书签栏</b>（或复制脚本存为书签）<br>" +
         "2. 新标签打开 <code>chatgpt.com</code> 并登录<br>" +
         "3. 点一下书签——脚本会自动把 Token 回传到本机 AI Hub，页面会提示「已添加账号」<br><br>" +
-        '<b>方式三 · 手动粘贴</b>（前两种都失败时再用）<br>" +
+        "<b>方式三 · 手动粘贴</b>（前两种都失败时再用）<br>" +
         '<div class="bm"><a href="' +
         bm.replace(/"/g, "&quot;") +
         '" onclick="return false;">AI Hub 抓取</a>' +
@@ -902,28 +955,29 @@
       };
   }
 
-  // ---------- ChatGPT OAuth ----------
+  // ---------- ChatGPT OAuth（loopback 全自动） ----------
   async function capOauthStart() {
     if (!capturePid) return;
+    const btn = $("capOauthStart");
     try {
+      btn.disabled = true;
       const r = await invoke("oauth-start", { email_hint: "" });
       oauthSession = r.session_id;
       window.open(r.authorize_url, "_blank", "noopener");
       $("capOauthHint").textContent =
-        "已打开授权页：登录完成后，把浏览器地址栏里的完整网址粘贴到下方，点「完成登录」";
-      setTimeout(() => {
-        const t = $("capOauthCallback");
-        if (t) t.focus();
-      }, 400);
+        "已打开授权页：登录完成后会自动跳回本机并添加账号，这个弹窗会自动关闭";
+      btn.textContent = "等待浏览器授权…";
     } catch (e) {
       toast("启动 OAuth 失败：" + e, "err");
+      btn.disabled = false;
+      btn.textContent = "🔑 一键登录 ChatGPT";
     }
   }
 
   async function capOauthFinish() {
     const cb = ($("capOauthCallback").value || "").trim();
     if (!oauthSession) {
-      toast("请先点「打开 OpenAI 授权页」", "warn");
+      toast("请先点「一键登录 ChatGPT」", "warn");
       return;
     }
     if (!cb) {
@@ -939,7 +993,7 @@
     } catch (e) {
       toast("OAuth 登录失败：" + e, "err");
       btn.disabled = false;
-      btn.textContent = "完成登录";
+      btn.textContent = "手动完成登录";
     }
   }
 
@@ -1201,6 +1255,15 @@
     // ChatGPT OAuth 按钮
     $("capOauthStart").onclick = capOauthStart;
     $("capOauthFinish").onclick = capOauthFinish;
+
+    // 日志
+    $("viewLog").onclick = openLog;
+    $("logRefresh").onclick = refreshLog;
+    $("logClose").onclick = () => $("logModal").classList.add("hidden");
+    $("closeLog").onclick = () => $("logModal").classList.add("hidden");
+    $("logModal").addEventListener("click", (e) => {
+      if (e.target === $("logModal")) $("logModal").classList.add("hidden");
+    });
     const input = $("input");
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {

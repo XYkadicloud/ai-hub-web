@@ -374,3 +374,42 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; line-height: 1.5;
 }
 #capOauthCallback:focus { outline: none; border-color: var(--accent); }
+
+/* ============ 启动失败错误条 / 日志 ============ */
+.fatal {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  z-index: 99; max-width: 640px; width: calc(100% - 48px);
+  background: #3a1f22; border: 1px solid var(--danger); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 14px 18px;
+}
+.fatal-inner { display: flex; flex-direction: column; gap: 6px; color: #ffd9db; }
+.fatal-msg {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px; background: rgba(0,0,0,0.25); border-radius: 8px;
+  padding: 8px 10px; word-break: break-all;
+}
+.fatal-hint { font-size: 12px; color: #e8a9ad; line-height: 1.7; }
+.fatal-hint code { background: rgba(0,0,0,0.3); padding: 1px 6px; border-radius: 5px; }
+.foot-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.data-dir {
+  font-size: 11.5px; color: var(--text-dim2); cursor: pointer; max-width: 300px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.data-dir:hover { color: var(--accent-2); }
+.log-pre {
+  margin: 0; max-height: 380px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 9px;
+  padding: 10px 12px; font-size: 12px; line-height: 1.6;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: var(--text-dim);
+}
+
+/* OAuth 手动兜底（折叠区） */
+.cap-fallback { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 10px; }
+.cap-fallback > summary {
+  cursor: pointer; font-size: 12.5px; color: var(--text-dim2); list-style: none;
+  padding: 4px 0; user-select: none;
+}
+.cap-fallback > summary::-webkit-details-marker { display: none; }
+.cap-fallback > summary::before { content: "▸ "; }
+.cap-fallback[open] > summary::before { content: "▾ "; }
+.cap-fallback > summary:hover { color: var(--accent-2); }

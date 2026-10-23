@@ -229,4 +229,12 @@
       navigator.sendBeacon("/api/quit");
     } catch (e) {}
   });
+
+  // 心跳（5s）：证明本标签页还活着。服务端收到任何请求都会取消「待退出」，
+  // 因此多标签场景下关掉其中一个不会把服务一起带走。
+  try {
+    setInterval(function () {
+      fetch("/api/ping", { method: "POST", cache: "no-store" }).catch(function () {});
+    }, 5000);
+  } catch (e) {}
 })();

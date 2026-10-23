@@ -81,7 +81,41 @@
 
         <div class="modal-foot">
           <div id="buildInfo" class="build-info"></div>
-          <button id="saveSettings" class="primary">保存</button>
+          <div class="foot-right">
+            <span id="dataDirInfo" class="data-dir" title="数据目录（点击复制）"></span>
+            <button id="viewLog" class="ghost sm" title="查看启动日志">📄 日志</button>
+            <button id="saveSettings" class="primary">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 启动失败错误条（JS 崩溃时至少让用户看见原因） -->
+    <div id="fatalBar" class="fatal hidden">
+      <div class="fatal-inner">
+        <b>界面初始化失败</b>
+        <div id="fatalMsg" class="fatal-msg"></div>
+        <div class="fatal-hint">
+          常见原因：端口被其他程序占用、杀毒软件拦截、数据目录配置损坏。<br>
+          数据目录：<code id="fatalDir">%APPDATA%\ai-hub</code>（里面 startup.log 有启动日志）。
+          也可以换端口启动：<code>ai-hub-web.exe --port 9000</code>
+        </div>
+      </div>
+    </div>
+
+    <!-- 日志查看弹窗 -->
+    <div id="logModal" class="modal hidden">
+      <div class="modal-box capture-box">
+        <div class="modal-head">
+          <div class="cap-title">启动日志</div>
+          <button id="closeLog" class="ghost">✕</button>
+        </div>
+        <div class="cap-body">
+          <pre id="logText" class="log-pre"></pre>
+        </div>
+        <div class="modal-foot">
+          <button id="logRefresh" class="ghost">刷新</button>
+          <button id="logClose" class="primary">关闭</button>
         </div>
       </div>
     </div>
@@ -122,21 +156,24 @@
           <!-- ChatGPT OAuth 一键登录 -->
           <div id="capOauthWrap" class="hidden">
             <div class="cap-oauth">
-              <button id="capOauthStart" class="primary sm">🔑 打开 OpenAI 授权页</button>
-              <span class="hint">用官方 OAuth 登录，自动续期，无需手动抓包</span>
+              <button id="capOauthStart" class="primary">🔑 一键登录 ChatGPT</button>
+              <span id="capOauthHint" class="hint">点一下 → 浏览器里登录 → 自动回到这里，无需复制任何东西</span>
             </div>
-            <label class="cap-label">授权完成后，把浏览器地址栏的完整网址粘贴到这里</label>
-            <textarea id="capOauthCallback" rows="2" placeholder="https://platform.openai.com/auth/callback?code=...&state=..." spellcheck="false"></textarea>
-            <div class="cap-oauth">
-              <button id="capOauthFinish" class="primary sm">完成登录</button>
-              <span id="capOauthHint" class="hint">授权页登录后会跳转到一个显示错误的页面，属正常现象，复制地址栏网址即可</span>
-            </div>
+            <details id="capOauthFallback" class="cap-fallback">
+              <summary>自动登录失败？手动完成</summary>
+              <label class="cap-label">授权完成后，把浏览器地址栏的完整网址粘贴到这里</label>
+              <textarea id="capOauthCallback" rows="2" placeholder="http://127.0.0.1:25880/auth/callback?code=...&state=..." spellcheck="false"></textarea>
+              <div class="cap-oauth">
+                <button id="capOauthFinish" class="ghost sm">手动完成登录</button>
+                <span class="hint">授权页显示「令牌已失效」属正常现象，地址栏里的 code 仍然有效</span>
+              </div>
+            </details>
           </div>
 
           <label class="cap-label" id="capInputLabel">粘贴 Token</label>
           <textarea id="capInput" rows="4" placeholder=""></textarea>
           <div id="capCookieWrap" class="hidden">
-            <label class="cap-label">Cookie（可选，推荐一并粘贴以提高成功率）</label>
+            <label class="cap-label" id="capCookieLabel">Cookie（可选，推荐一并粘贴以提高成功率）</label>
             <textarea id="capCookie" rows="3" placeholder="从浏览器复制的完整 Cookie"></textarea>
           </div>
           <div id="capStatus" class="cap-status"></div>

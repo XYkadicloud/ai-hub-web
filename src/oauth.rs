@@ -1,20 +1,24 @@
 //! ChatGPT 官方 OAuth（PKCE 授权码）登录与 Token 续期。
 //!
-//! 流程参考社区长期维护的 chat2api 类项目（`yukkcat/chatgpt2api` 的
-//! `services/oauth_login_service.py`）：
+//! **主流程（全自动，对齐 Codex CLI）**：Auth0 给 Codex CLI 的公开客户端
+//! 注册了 loopback 回调（任意 localhost 端口），所以我们把授权回调指向本机
+//! 服务自身：
 //!
 //! 1. 后端生成 `code_verifier` / `code_challenge`（S256）与 `state`，
-//!    构造 `auth.openai.com/api/accounts/authorize` 授权链接；
+//!    构造 `auth.openai.com/oauth/authorize` 授权链接，
+//!    `redirect_uri=http://127.0.0.1:<本服务端口>/auth/callback`；
 //! 2. 用户在系统浏览器里正常登录 OpenAI；
-//! 3. OpenAI 把浏览器重定向到 `platform.openai.com/auth/callback?code=...`，
-//!    用户把地址栏 URL 回填（页面本身会报错，但 URL 里的 code 有效）；
-//! 4. 后端用 verifier + code 调 `/api/accounts/oauth/token` 换取
+//! 3. 浏览器被重定向回**本机服务**，服务端直接拿到 code；
+//! 4. 用 verifier + code 调 `/oauth/token`（form 编码）换取
 //!    `access_token` / `refresh_token` / `id_token`；
 //! 5. 之后 access_token 临期或失效时，用 refresh_token 调 `/oauth/token`
 //!    自动续期（无需用户再次登录）。
 //!
-//! 这样拿到的 access_token 与网页版抓包得到的 JWT 同规格，可直接用于
-//! `backend-api` 调用，且能自动续期，比一次性抓 token 更稳。
+//! 全程零复制粘贴、零书签。拿到的 access_token 与网页版抓包得到的 JWT
+//! 同规格，可直接用于 `backend-api` 调用。
+//!
+//! 另保留 platform 回调的手动粘网址流程作兜底（`authorize_url` /
+//! `exchange_code`），loopback 因故失败时用户仍可粘贴回调 URL 完成登录。
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -33,12 +37,24 @@ const AUTH0_CLIENT: &str =
     "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 
+/// Codex CLI 官方 OAuth 客户端（同样是无 secret 的公开客户端）。
+/// 关键优势：Auth0 为它注册了 **loopback 回调**（任意 localhost 端口均可），
+/// 于是可以把授权回调直接指向本机服务——用户点一下、在浏览器里登录，
+/// code 自动回到我们手里，全自动完成，无需复制网址/书签。
+/// 流程与参数对齐 OpenAI 官方开源的 codex CLI（codex-rs/login/src/server.rs）。
+pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_SCOPE: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+
 /// 一次待完成的 OAuth 授权会话（内存中，10 分钟有效）。
 #[derive(Clone, Debug)]
 pub struct PendingOAuth {
     pub code_verifier: String,
     pub code_challenge: String,
     pub state: String,
+    /// 本次授权实际使用的 redirect_uri（换 token 时必须原样回传）。
+    pub redirect_uri: String,
 }
 
 /// 生成 PKCE 对：返回 (code_verifier, code_challenge)。
@@ -59,7 +75,30 @@ pub fn random_hex(n: usize) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// 构造授权 URL。
+/// 构造 Codex 风格的授权 URL（loopback 回调 → 全自动登录）。
+/// `redirect_uri` 形如 `http://127.0.0.1:<端口>/auth/callback`。
+pub fn codex_authorize_url(pending: &PendingOAuth, redirect_uri: &str) -> String {
+    let params = vec![
+        ("response_type".to_string(), "code".to_string()),
+        ("client_id".to_string(), CODEX_CLIENT_ID.to_string()),
+        ("redirect_uri".to_string(), redirect_uri.to_string()),
+        ("code_challenge".to_string(), pending.code_challenge.clone()),
+        ("code_challenge_method".to_string(), "S256".to_string()),
+        ("state".to_string(), pending.state.clone()),
+        ("scope".to_string(), CODEX_SCOPE.to_string()),
+        ("id_token_add_organizations".to_string(), "true".to_string()),
+        ("codex_cli_simplified_flow".to_string(), "true".to_string()),
+        ("originator".to_string(), CODEX_ORIGINATOR.to_string()),
+    ];
+    let qs = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, url_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{}/oauth/authorize?{}", AUTH_BASE, qs)
+}
+
+/// 构造授权 URL（platform 回调，手动粘网址的备用流程）。
 pub fn authorize_url(pending: &PendingOAuth, email_hint: &str) -> String {
     let mut params = vec![
         ("issuer".to_string(), AUTH_BASE.to_string()),
@@ -96,14 +135,19 @@ pub fn authorize_url(pending: &PendingOAuth, email_hint: &str) -> String {
     format!("{}/api/accounts/authorize?{}", AUTH_BASE, qs)
 }
 
-/// 从回调 URL（或裸 code）提取 (code, state)。
-pub fn extract_code(value: &str) -> Result<(String, String), String> {
+/// 从回调 URL（或裸 code）提取 (code, state, base_uri)。
+/// `base_uri` 是去掉查询串的 URL 本体——loopback 流程下用户粘回来的
+/// `http://127.0.0.1:<端口>/auth/callback?code=...` 正好用它当 redirect_uri。
+pub fn extract_callback(value: &str) -> Result<(String, String, String), String> {
     let raw = value.trim();
     if raw.is_empty() {
         return Err("缺少 code 或回调 URL".into());
     }
     if raw.starts_with("http://") || raw.starts_with("https://") {
-        let query = raw.split('?').nth(1).unwrap_or("");
+        let (base, query) = match raw.split_once('?') {
+            Some((b, q)) => (b.to_string(), q),
+            None => (raw.to_string(), ""),
+        };
         let mut code = String::new();
         let mut state = String::new();
         for kv in query.split('&') {
@@ -120,10 +164,16 @@ pub fn extract_code(value: &str) -> Result<(String, String), String> {
         if code.is_empty() {
             return Err("回调 URL 里没有 code 参数（登录可能未完成）".into());
         }
-        Ok((code, state))
+        Ok((code, state, base))
     } else {
-        Ok((raw.to_string(), String::new()))
+        Ok((raw.to_string(), String::new(), String::new()))
     }
+}
+
+/// 从回调 URL（或裸 code）提取 (code, state)。
+pub fn extract_code(value: &str) -> Result<(String, String), String> {
+    let (code, state, _) = extract_callback(value)?;
+    Ok((code, state))
 }
 
 /// code + verifier 换取 token 三件套。
@@ -153,24 +203,59 @@ pub async fn exchange_code(
     parse_token_response(resp, "OpenAI 拒绝换 token").await
 }
 
-/// refresh_token 续期 access_token。
-pub async fn refresh_token(
+/// code + verifier 换取 token 三件套（Codex loopback 流程）。
+/// 与 Codex CLI 一致：form 编码 POST 到 `/oauth/token`。
+pub async fn codex_exchange_code(
     client: &reqwest::Client,
-    refresh_token: &str,
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
 ) -> Result<TokenSet, String> {
     let resp = client
         .post(format!("{}/oauth/token", AUTH_BASE))
         .header("Accept", "application/json")
         .header("User-Agent", BROWSER_UA)
         .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", OAUTH_CLIENT_ID),
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", CODEX_CLIENT_ID),
+            ("code_verifier", code_verifier),
         ])
         .send()
         .await
-        .map_err(|e| format!("刷新 token 网络异常: {}", e))?;
-    parse_token_response(resp, "OpenAI 拒绝刷新 token").await
+        .map_err(|e| format!("换 token 网络异常: {}", e))?;
+    parse_token_response(resp, "OpenAI 拒绝换 token").await
+}
+
+/// refresh_token 续期 access_token。
+///
+/// 先用 Codex 客户端（我们的账号基本都是它签发的），失败再退回平台客户端，
+/// 兼容早期用 platform 流程添加的账号。
+pub async fn refresh_token(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<TokenSet, String> {
+    let mut last_err = String::new();
+    for cid in [CODEX_CLIENT_ID, OAUTH_CLIENT_ID] {
+        let resp = client
+            .post(format!("{}/oauth/token", AUTH_BASE))
+            .header("Accept", "application/json")
+            .header("User-Agent", BROWSER_UA)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", cid),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("刷新 token 网络异常: {}", e))?;
+        match parse_token_response(resp, "OpenAI 拒绝刷新 token").await {
+            Ok(t) => return Ok(t),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 async fn parse_token_response(
@@ -309,7 +394,8 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn uuid_v4() -> String {
+/// 生成标准 UUID v4（Claude 的 turn_message_uuid 等需要）。
+pub fn uuid_v4() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

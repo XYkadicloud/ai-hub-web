@@ -20,7 +20,10 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::Utc;
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, AUTHORIZATION, CONTENT_TYPE, COOKIE,
+    ORIGIN, REFERER, USER_AGENT,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -44,7 +47,7 @@ fn now_secs() -> i64 {
 }
 
 const CHATGPT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
-const CLAUDE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
+const CLAUDE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 const ANTHROPIC_CLIENT_VERSION: &str = "2025-04-01";
 /// chatgpt.com 前端构建号，仅参与 PoW 载荷构造（服务端不校验其内容）。
 const DEFAULT_DPL: &str = "prod-f501fe933b3edf57aea882da888e1a544df99840";
@@ -205,6 +208,7 @@ async fn run_web(
                     &client,
                     &provider.base_url,
                     &sec,
+                    acc.cookie.as_deref(),
                     model,
                     messages,
                     attempt,
@@ -465,10 +469,58 @@ fn handle_chatgpt_event(
 
 // ============================ Claude 网页版 ============================
 
+/// 组装 Claude 的 Cookie：优先用用户粘贴的完整 Cookie（含 cf_clearance 等
+/// Cloudflare 校验项），否则退回只带 sessionKey。
+fn claude_cookie(session_key: &str, cookie_extra: Option<&str>) -> String {
+    let sk = session_key.trim();
+    match cookie_extra {
+        Some(c) if c.trim().len() > 24 => {
+            let c = c.trim();
+            if c.contains("sessionKey=") {
+                c.to_string()
+            } else {
+                format!("{}; sessionKey={}", c, sk)
+            }
+        }
+        _ => format!("sessionKey={}", sk),
+    }
+}
+
+/// Claude 网页端请求头。尽量还原真实浏览器特征——Cloudflare / 风控会看这些头，
+/// 只有 UA + Cookie 很容易被判定为非浏览器客户端而直接 403。
+fn claude_headers(cookie: &str) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, hv("application/json")?);
+    headers.insert(USER_AGENT, hv(CLAUDE_UA)?);
+    headers.insert(COOKIE, hv(cookie)?);
+    headers.insert(
+        HeaderName::from_bytes(b"anthropic-client-version").map_err(|e| e.to_string())?,
+        hv(ANTHROPIC_CLIENT_VERSION)?,
+    );
+    headers.insert(ACCEPT_LANGUAGE, hv("en-US,en;q=0.9")?);
+    for (k, v) in [
+        ("anthropic-client-platform", "web_claude_ai"),
+        ("anthropic-device-id", "d7c1f0a4-6f3b-4b2e-9c8a-2f5e1b7d9a30"),
+        ("sec-ch-ua", "\"Chromium\";v=\"142\", \"Not:A-Brand\";v=\"24\""),
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-platform", "\"Windows\""),
+        ("sec-fetch-dest", "empty"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-site", "same-origin"),
+        ("priority", "u=1, i"),
+    ] {
+        if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), hv(v)) {
+            headers.insert(name, val);
+        }
+    }
+    Ok(headers)
+}
+
 async fn claude_send(
     client: &Client,
     base_url: &str,
     session_key: &str,
+    cookie_extra: Option<&str>,
     model: &str,
     messages: &[ChatMessage],
     mut meta: WebMeta,
@@ -482,16 +534,12 @@ async fn claude_send(
         base
     };
 
-    let cookie = format!("sessionKey={}", session_key.trim());
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, hv("application/json")?);
-    headers.insert(USER_AGENT, hv(CLAUDE_UA)?);
-    headers.insert(COOKIE, hv(&cookie)?);
-    headers.insert(
-        HeaderName::from_bytes(b"anthropic-client-version").map_err(|e| e.to_string())?,
-        hv(ANTHROPIC_CLIENT_VERSION)?,
-    );
+    // 只给 sessionKey 时风控通过率较低；用户若粘贴了完整 Cookie（含
+    // cf_clearance 等），则整串带上，Cloudflare 校验会宽松很多。
+    let cookie = claude_cookie(session_key, cookie_extra);
+    let mut headers = claude_headers(&cookie)?;
     headers.insert(ACCEPT, hv("text/event-stream")?);
+    headers.insert(ORIGIN, hv("https://claude.ai")?);
 
     // 1) 组织 UUID
     let org = if let Some(o) = meta.claude_org_uuid.clone() {
@@ -592,13 +640,21 @@ async fn claude_send(
     if let Some(p) = meta.claude_parent_uuid.clone() {
         body["parent_message_uuid"] = json!(p);
     }
+    // 新版网页端每轮都会带一个 turn_message_uuid，缺了容易被判为异常客户端
+    body["turn_message_uuid"] = json!(oauth::uuid_v4());
+
+    // Referer 必须指向具体会话，风控会校验来源页面
+    let mut send_headers = headers.clone();
+    if let Ok(v) = hv(&format!("https://claude.ai/chat/{}", conv_uuid)) {
+        send_headers.insert(REFERER, v);
+    }
 
     let resp = client
         .post(format!(
             "{}/organizations/{}/chat_conversations/{}/completion",
             base, org, conv_uuid
         ))
-        .headers(headers)
+        .headers(send_headers)
         .json(&body)
         .send()
         .await
@@ -905,7 +961,11 @@ pub async fn verify_chatgpt(
 }
 
 /// 校验 Claude sessionKey 是否有效，返回组织信息。
-pub async fn verify_claude(session_key: &str, base_url: &str) -> Result<Value, String> {
+pub async fn verify_claude(
+    session_key: &str,
+    cookie_extra: Option<&str>,
+    base_url: &str,
+) -> Result<Value, String> {
     let base = base_url.trim().trim_end_matches('/');
     let base = if base.is_empty() {
         "https://claude.ai/api"
@@ -916,14 +976,8 @@ pub async fn verify_claude(session_key: &str, base_url: &str) -> Result<Value, S
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, hv("application/json")?);
-    headers.insert(USER_AGENT, hv(CLAUDE_UA)?);
-    headers.insert(COOKIE, hv(&format!("sessionKey={}", session_key.trim()))?);
-    headers.insert(
-        HeaderName::from_bytes(b"anthropic-client-version").map_err(|e| e.to_string())?,
-        hv(ANTHROPIC_CLIENT_VERSION)?,
-    );
+    let cookie = claude_cookie(session_key, cookie_extra);
+    let headers = claude_headers(&cookie)?;
     let resp = client
         .get(format!("{}/account", base))
         .headers(headers)
@@ -961,7 +1015,30 @@ async fn http_err(stage: &str, resp: reqwest::Response) -> String {
     let short: String = text.chars().take(300).collect();
     match code {
         401 => format!("{} 鉴权失败/登录已过期（请重新抓取 Token）", stage),
-        403 => format!("{} 被风控拦截或无权限：{}", stage, short),
+        403 => {
+            let low = text.to_lowercase();
+            let is_cf = low.contains("cloudflare")
+                || low.contains("<!doctype html")
+                || low.contains("just a moment")
+                || low.contains("attention required");
+            let banned = low.contains("banned")
+                || low.contains("blocked")
+                || low.contains("violat")
+                || low.contains("suspended");
+            if banned {
+                format!(
+                    "{} 账号被风控/封禁，换一个账号再试：{}",
+                    stage, short
+                )
+            } else if is_cf {
+                format!(
+                    "{} 被 Cloudflare 拦截：请粘贴**完整 Cookie**（含 cf_clearance）而不是只给 sessionKey：{}",
+                    stage, short
+                )
+            } else {
+                format!("{} 被风控拦截或无权限：{}", stage, short)
+            }
+        }
         429 => format!("{} 触发限流或额度用尽", stage),
         _ => format!("{} HTTP {}: {}", stage, code, short),
     }

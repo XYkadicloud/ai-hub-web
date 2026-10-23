@@ -69,6 +69,11 @@ fn parse_web_dir() -> Option<PathBuf> {
     None
 }
 
+/// `--no-open`：只起服务不自动打开浏览器（服务端模式 / 调试用）。
+fn parse_no_open() -> bool {
+    std::env::args().skip(1).any(|a| a == "--no-open" || a == "--no-browser")
+}
+
 /// 端口优先级：`--port` > `AI_HUB_PORT` > 默认固定端口。
 fn parse_port() -> u16 {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -118,9 +123,36 @@ async fn run() {
         web_dir,
         aborts: Arc::new(Mutex::new(HashMap::new())),
         oauth_pending: Arc::new(Mutex::new(HashMap::new())),
+        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        saw_client: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        last_activity: Arc::new(std::sync::atomic::AtomicI64::new(server::now_secs())),
+        quit_deadline: Arc::new(Mutex::new(None)),
+        port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
     };
     let app = server::build_router(state.clone());
     let shutdown = state.shutdown.clone();
+
+    // 退出 watcher：页面关闭（/api/quit 设死线）或页面被强杀（无 SSE 无请求）
+    // 才真正退出；刷新页面不会误杀。详见 server::should_quit。
+    {
+        let st = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if server::should_quit(
+                    &st.quit_deadline,
+                    &st.sse_clients,
+                    &st.saw_client,
+                    &st.last_activity,
+                ) {
+                    log(&st.data_dir, "检测到页面已关闭，正在退出");
+                    shutdown.notify_one();
+                    break;
+                }
+            }
+        });
+    }
 
     // 固定端口优先（书签脚本/OAuth 依赖端口稳定），被占用则回退随机端口
     let want = parse_port();
@@ -138,11 +170,16 @@ async fn run() {
         }
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    state
+        .port
+        .store(port, std::sync::atomic::Ordering::Relaxed);
     let url = format!("http://127.0.0.1:{}/", port);
     log(&dir, &format!("AI Hub 已启动: {}（固定端口 {}）", url, want));
 
-    // 自动打开系统默认浏览器
-    let _ = open::that(&url);
+    // 自动打开系统默认浏览器（--no-open 时跳过）
+    if !parse_no_open() {
+        let _ = open::that(&url);
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -150,6 +187,13 @@ async fn run() {
                 _ = shutdown.notified() => {}
                 _ = tokio::signal::ctrl_c() => {}
             }
+            // SSE 长连接不会自己结束，优雅关闭可能一直挂着——
+            // 3 秒后强制退出，保证进程一定能退干净（不会留下
+            // 「无监听端口但占着连接」的僵尸状态）。
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                std::process::exit(0);
+            });
         })
         .await
         .ok();

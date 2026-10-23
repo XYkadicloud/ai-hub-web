@@ -211,18 +211,28 @@ tauri-shim.js  ──把 __TAURI__.core.invoke 翻译成 fetch──┐
 **已知门槛**：Cloudflare 403 / Turnstile / Arkose 人机验证可能间歇性出现，
 出现时本实现会报错并由账号池切下一个账号，不做自动过验证。
 
-**OAuth 登录（新增，推荐）**：账号也可通过官方 OAuth（PKCE 授权码）获得——
-`src/oauth.rs` 按社区项目 `yukkcat/chatgpt2api` 的公开流程实现：
+**OAuth 登录（一键，全自动）**：账号通过官方 OAuth（PKCE 授权码）获得，
+**不需要复制网址、不需要书签**——点一下按钮，浏览器里登录完就自动回来了。
 
-1. `POST /api/oauth/start` 生成 `code_verifier`/`state`，返回 authorize URL；
-2. 用户在系统浏览器登录，回调落在 `platform.openai.com/auth/callback?code=...`；
-3. `POST /api/oauth/finish` 用 code 换 `access_token` + `refresh_token` + `id_token`，
-   JWT 解析出 email / `chatgpt_account_id` 存入账号 meta；
-4. 之后每次对话前检查 AT 临期（<5 分钟）即用 refresh_token 自动续期并写回账号池。
+实现对齐 OpenAI 官方开源的 Codex CLI（`codex-rs/login/src/server.rs`）：
+Auth0 给 Codex 这个公开客户端注册了 **loopback 回调**（任意 localhost 端口合法），
+所以把回调直接指向本服务自己：
 
-授权参数：`client_id = app_2SKx67EdpoN0G6j64rFvigXD`（公开客户端，无 secret），
-scope `openid profile email offline_access`，兑换端点 `auth.openai.com/api/accounts/oauth/token`，
-续期端点 `auth.openai.com/oauth/token`（form-urlencoded）。
+1. `POST /api/oauth/start` 生成 `code_verifier`/`state`，
+   `redirect_uri = http://127.0.0.1:<本服务端口>/auth/callback`；
+2. 前端 `window.open(authorize_url)`，用户在浏览器里正常登录 OpenAI；
+3. OpenAI 把浏览器 302 回**本机服务**的 `/auth/callback?code=...&state=...`，
+   服务端直接拿 code 换 token（form-urlencoded POST `auth.openai.com/oauth/token`）；
+4. 落账号池（JWT 解析 email / `chatgpt_account_id` / `plan_type`），
+   浏览器那页显示「登录成功，本页会自动关闭」，前端收 `login-captured` 事件自动收尾；
+5. 之后每次对话前检查 AT 临期（<5 分钟）即用 refresh_token 自动续期并写回账号池。
+
+授权参数：`client_id = app_EMoamEEZ73f0CkXaXp7hrann`（Codex 公开客户端，无 secret），
+`scope = openid profile email offline_access api.connectors.read api.connectors.invoke`，
+附加 `codex_cli_simplified_flow=true&id_token_add_organizations=true&originator=codex_cli_rs`。
+
+> 若 loopback 因防火墙/代理被拦，弹窗里还有「自动登录失败？手动完成」折叠区：
+> 把回调页地址栏 URL 粘进去点「手动完成登录」，走 `POST /api/oauth/finish` 兜底。
 
 ### 6.4 `claude_web` —— Claude 网页版
 
@@ -268,8 +278,9 @@ scope `openid profile email offline_access`，兑换端点 `auth.openai.com/api/
 | POST | `/api/upload` | 原始字节上传附件（query: name/mime，body 为字节） |
 | GET | `/api/files/:id` | 读取上传的附件文件 |
 | GET | `/api/images/:id` | 读取生图结果（png） |
-| POST | `/api/oauth/start` | ChatGPT OAuth 第一步：生成 PKCE + authorize URL |
-| POST | `/api/oauth/finish` | ChatGPT OAuth 第二步：code 换 token，落账号池 |
+| POST | `/api/oauth/start` | ChatGPT OAuth 第一步：生成 PKCE + loopback authorize URL |
+| GET | `/auth/callback` | **OAuth 自动回调**：浏览器被 302 回来，服务端直接换 token 落账号池 |
+| POST | `/api/oauth/finish` | OAuth 手动兜底：粘贴回调 URL 换 token |
 | GET | `/api/conversations` | 会话列表 |
 | POST | `/api/conversations` | 新建会话 |
 | GET | `/api/conversations/:id` | 读取会话（含 messages、meta） |
@@ -277,7 +288,9 @@ scope `openid profile email offline_access`，兑换端点 `auth.openai.com/api/
 | POST | `/api/conversations/:id/rename` | 重命名 |
 | POST | `/api/conversations/:id/messages` | 追加一条消息（body 支持 `attachments`） |
 | GET | `/api/events` | **SSE 长连接**，推送 `chat_stream` / `account_ok` / `account_switch` / `login-captured` 等 |
-| POST | `/api/quit` | 优雅退出（页面关闭时 sendBeacon 调用） |
+| POST | `/api/quit` | 页面关闭通知（sendBeacon）：设 8s 退出死线，期间任何请求都会取消 |
+| POST | `/api/ping` | 前端 5s 心跳，用于「还有标签页开着」的存活判定 |
+| GET | `/api/debug-exit` | 诊断：查看退出死线 / SSE 计数 / should_quit |
 | GET | `/*path` | 静态资源兜底（内嵌或 `--web-dir`） |
 
 > 所有接口监听 `127.0.0.1`，无鉴权（单用户本机应用）。响应统一带 CORS 头，
