@@ -30,6 +30,10 @@ pub enum ChatEvent {
     Switch { account: String, reason: String },
     /// 当前生效账号（成功建立连接时）
     Active { account: String },
+    /// Agent 开始调用某个工具（携带工具名与参数）
+    ToolCall { name: String, args: Value },
+    /// Agent 的工具调用结束（携带一行摘要）
+    ToolResult { name: String, ok: bool, summary: String },
     /// 流结束
     Done,
     /// 出错（所有账号都失败或致命错误）
@@ -49,6 +53,8 @@ pub struct ChatMessage {
 /// 遍历账号池做 failover：某账号失效/被封/额度耗尽时自动切下一个健康账号。
 ///
 /// `image_mode`：用户手动打开 🎨 开关（或模型名是生图模型）时走生图分支。
+/// `agent_mode`：开启 Agent 能力（工具调用 + 联网）。**只对 API 协议生效**——
+/// ChatGPT 网页版刻意不接，网页端逆向叠加高频工具循环几乎必然封号。
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_chat(
     dir: &Path,
@@ -58,20 +64,38 @@ pub async fn stream_chat(
     conv_id: &str,
     tx: mpsc::UnboundedSender<ChatEvent>,
     image_mode: bool,
+    agent_mode: bool,
     abort: Option<AbortFlag>,
 ) {
-    // 按协议类型分发：网页版（ChatGPT / Claude）走 webchat 模块
+    // 按协议类型分发：ChatGPT 网页版走 webchat 模块，其余走 API 协议
     let ptype = load_config(dir)
         .ok()
         .and_then(|c| c.providers.into_iter().find(|p| p.id == provider_id))
         .map(|p| p.ptype)
         .unwrap_or_else(|| "openai".to_string());
 
-    if ptype == "chatgpt_web" || ptype == "claude_web" {
+    if ptype == "chatgpt_web" {
+        // 网页版不支持 Agent：即便用户开了开关也按普通对话走，避免封号
         crate::webchat::stream_web_chat(
             dir, provider_id, model, messages, conv_id, tx, abort,
         )
         .await;
+        return;
+    }
+
+    // Agent 分支：让模型自己决定调工具（搜索 / 抓网页 / 计算 / 时间）
+    if agent_mode && !is_image_model(model) {
+        let opts = crate::agent::AgentOpts::default();
+        let r = if ptype == "gemini_native" {
+            crate::agent::run_gemini_agent(dir, provider_id, model, messages, &tx, &abort, &opts)
+                .await
+        } else {
+            crate::agent::run_openai_agent(dir, provider_id, model, messages, &tx, &abort, &opts)
+                .await
+        };
+        if let Err(e) = r {
+            let _ = tx.send(ChatEvent::Error(e));
+        }
         return;
     }
 
@@ -396,7 +420,7 @@ fn handle_event(event: &str, tx: &mpsc::UnboundedSender<ChatEvent>) -> bool {
     got
 }
 
-fn classify_error(code: u16, body: &str) -> String {
+pub fn classify_error(code: u16, body: &str) -> String {
     // 尽量把服务端给的原因原样带出来，比只报状态码有用得多
     let detail = serde_json::from_str::<Value>(body)
         .ok()

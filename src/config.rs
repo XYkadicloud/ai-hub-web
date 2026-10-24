@@ -31,7 +31,7 @@ pub struct Account {
     #[serde(default)]
     pub cookie: Option<String>, // ChatGPT 网页版需要完整 Cookie
     #[serde(default)]
-    pub meta: Option<serde_json::Value>, // 协议附加信息（Claude org_uuid、ChatGPT 用户信息等）
+    pub meta: Option<serde_json::Value>, // 协议附加信息（ChatGPT 账号信息等）
     #[serde(default = "default_status")]
     pub status: String, // "active" | "disabled" | "error" | "expired"
     #[serde(default)]
@@ -120,22 +120,23 @@ fn default_config() -> AppConfig {
                 accounts: vec![],
             },
             Provider {
+                // Claude 网页版（sessionKey 逆向）已删除：容易封号，且实测账号被限流。
+                // 保留一张「Claude API」卡片，走 OpenAI 兼容协议，因此自动获得
+                // Agent 能力（工具调用 / 联网搜索）。默认关闭，需要时填 Key 即可。
                 id: "claude".into(),
-                name: "Claude (网页版登录)".into(),
-                ptype: "claude_web".into(),
-                base_url: "https://claude.ai/api".into(),
+                name: "Claude API（Agent 可用）".into(),
+                ptype: "openai".into(),
+                base_url: "https://api.anthropic.com/v1".into(),
                 api_key: "".into(),
-                login_url: Some("https://claude.ai".into()),
-                // 网页版只认不带日期后缀的别名；带日期的老名字会回
-                // model_not_available（不是账号问题，是名字不对）。
+                login_url: None,
                 models: vec![
                     "claude-sonnet-4-5".into(),
                     "claude-opus-4-1".into(),
-                    "claude-3-7-sonnet-latest".into(),
+                    "claude-haiku-4-5".into(),
                 ],
                 default_model: "claude-sonnet-4-5".into(),
                 proxy: None,
-                enabled: true,
+                enabled: false,
                 preferred_account: None,
                 accounts: vec![],
             },

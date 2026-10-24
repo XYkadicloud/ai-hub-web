@@ -122,10 +122,20 @@ fn textual_attachment_notes(dir: &Path, m: &crate::chat::ChatMessage) -> String 
                 }
             }
             "file" => {
-                notes.push_str(&format!(
-                    "\n\n【附件：{}（{} 字节，{}）——当前会话无法直接读取该文件内容】",
-                    a.name, a.size, a.mime
-                ));
+                // PDF / Office 在上传时已尽力提取正文；有内容就内联，
+                // 提不出来才退化成「只有文件名」的说明。
+                match attachment_text(dir, a) {
+                    Some(t) if !t.trim().is_empty() => notes.push_str(&format!(
+                        "\n\n【附件：{}（{} 字节）】\n```\n{}\n```",
+                        a.name,
+                        a.size,
+                        t.trim_end()
+                    )),
+                    _ => notes.push_str(&format!(
+                        "\n\n【附件：{}（{} 字节，{}）——无法读取该文件内容】",
+                        a.name, a.size, a.mime
+                    )),
+                }
             }
             _ => {}
         }
@@ -180,7 +190,7 @@ pub fn build_gemini_parts(dir: &Path, m: &crate::chat::ChatMessage) -> Vec<Value
     parts
 }
 
-/// 网页版协议（ChatGPT/Claude）只支持文本：附件降级为文字说明。
+/// ChatGPT 网页版只支持文本：附件降级为文字说明。
 pub fn build_web_text(dir: &Path, m: &crate::chat::ChatMessage) -> String {
     let mut notes = String::new();
     for a in &m.attachments {
@@ -191,7 +201,14 @@ pub fn build_web_text(dir: &Path, m: &crate::chat::ChatMessage) -> String {
                     notes.push_str(&format!("\n\n【附件：{}】\n{}", a.name, t.trim_end()));
                 }
             }
-            _ => notes.push_str(&format!("\n\n【附件：{}】", a.name)),
+            _ => match attachment_text(dir, a) {
+                Some(t) if !t.trim().is_empty() => notes.push_str(&format!(
+                    "\n\n【附件：{}】\n{}",
+                    a.name,
+                    t.trim_end()
+                )),
+                _ => notes.push_str(&format!("\n\n【附件：{}】", a.name)),
+            },
         }
     }
     if notes.is_empty() {

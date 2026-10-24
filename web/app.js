@@ -20,6 +20,8 @@
   let capturePid = null; // 当前正在抓取登录的 provider id
   let keyPid = null; // 当前正在添加 Key 的 provider id
   let imageMode = false; // 🎨 生图开关
+  let agentMode = false; // 🧩 Agent 开关（工具调用 + 联网，仅 API 端点）
+  let agentTimeline = []; // 当前这条助手消息的工具调用时间线
   let pendingAttachments = []; // 待发送附件
   let oauthSession = null; // ChatGPT OAuth 会话
 
@@ -208,6 +210,44 @@
       const rb = box.querySelector(".rbody");
       rb.textContent += d.delta;
       rb.scrollTop = rb.scrollHeight;
+      scrollBottom();
+    });
+    // 🧩 Agent 工具调用：以时间线形式呈现（对齐官方「正在搜索网页…」的体验）
+    listen("agent_tool", (e) => {
+      const d = e.payload;
+      if (d.conv_id !== curConv) return;
+      const live = document.querySelector('.msg.assistant[data-live="1"]');
+      if (!live) return;
+      let box = live.querySelector(".agent-timeline");
+      if (!box) {
+        box = el('<div class="agent-timeline"></div>');
+        live.insertBefore(box, live.querySelector(".body"));
+      }
+      if (d.phase === "call") {
+        agentTimeline.push({ name: d.name, args: d.args, done: false });
+        const row = el(
+          `<div class="agent-step running"><span class="spin">◌</span> ` +
+            `<span class="an">${escapeHtml(toolLabel(d.name))}</span>` +
+            `<span class="aq">${escapeHtml(toolArgText(d.name, d.args))}</span></div>`
+        );
+        row.dataset.idx = String(agentTimeline.length - 1);
+        box.appendChild(row);
+      } else {
+        const idx = agentTimeline.findIndex(
+          (t) => t.name === d.name && !t.done
+        );
+        const row =
+          (idx >= 0 && box.querySelector(`.agent-step[data-idx="${idx}"]`)) ||
+          box.lastElementChild;
+        if (row) {
+          agentTimeline[idx >= 0 ? idx : 0].done = true;
+          row.className = "agent-step " + (d.ok ? "ok" : "fail");
+          row.innerHTML =
+            `<span class="ic">${d.ok ? "✓" : "✕"}</span> ` +
+            `<span class="an">${escapeHtml(toolLabel(d.name))}</span>` +
+            `<span class="aq">${escapeHtml(d.summary || "")}</span>`;
+        }
+      }
       scrollBottom();
     });
     listen("account_switch", (e) => {
@@ -414,7 +454,9 @@
         })),
         conv_id: curConv,
         image_mode: imageMode,
+        agent_mode: agentMode,
       });
+      agentTimeline = [];
     } catch (e) {
       const node = document.querySelector('.msg.assistant[data-live="1"] .body');
       if (node) node.innerHTML += `<p class="err">${escapeHtml(e)}</p>`;
@@ -423,6 +465,50 @@
       $("stop").classList.add("hidden");
       toast("请求失败：" + e, "err");
     }
+  }
+
+  /** 🧩 Agent 开关：开启后 AI 可自己调用工具（联网搜索 / 抓网页 / 计算 / 时间）。
+   *  只对 API 端点生效——ChatGPT 网页版刻意不接，避免高频工具循环触发封号。 */
+  function setAgentMode(on) {
+    agentMode = on;
+    const btn = $("agentToggle");
+    btn.classList.toggle("active", on);
+    btn.title = on
+      ? "Agent 模式已开启：AI 可自己联网搜索、抓网页、做计算（仅 API 端点）"
+      : "Agent 模式：让 AI 自己调用工具（联网搜索 / 抓网页 / 计算）。仅 API 端点可用";
+    if (on && imageMode) setImageMode(false);
+    toastAgentHint();
+  }
+
+  function toastAgentHint() {
+    const p = (cfg.providers || []).find((x) => x.id === curProviderId);
+    if (!p) return;
+    if (p.ptype === "chatgpt_web") {
+      toast("ChatGPT 网页版不支持 Agent（易封号），本条将按普通对话发送", "warn");
+    } else if (p.ptype !== "openai" && p.ptype !== "gemini_native") {
+      toast("该端点不支持 Agent", "warn");
+    } else {
+      toast("Agent 已开启：AI 可自己联网搜索 / 抓网页 / 计算", "ok");
+    }
+  }
+
+  /** 工具名 → 中文标签。 */
+  function toolLabel(name) {
+    return (
+      {
+        web_search: "联网搜索",
+        fetch_url: "读取网页",
+        calculate: "计算",
+        get_current_time: "获取时间",
+      }[name] || name
+    );
+  }
+
+  /** 工具参数 → 一行可读文本。 */
+  function toolArgText(name, args) {
+    if (!args) return "";
+    const v = args.query || args.url || args.expression || "";
+    return v ? "：" + String(v).slice(0, 80) : "";
   }
 
   function stopStreaming() {
@@ -513,7 +599,6 @@
     return (
       {
         chatgpt_web: "ChatGPT 网页版（PoW）",
-        claude_web: "Claude 网页版（sessionKey）",
         gemini_native: "Gemini 原生协议",
         openai: "OpenAI 兼容接口",
       }[ptype] || ptype
@@ -526,12 +611,6 @@
       return [
         ["chatgpt_web", "ChatGPT 网页版（OAuth 登录 / 逆向）"],
         ["openai", "OpenAI 兼容（官方 API / 反代）"],
-      ];
-    }
-    if (p.id === "claude") {
-      return [
-        ["claude_web", "Claude 网页版（sessionKey）"],
-        ["openai", "OpenAI 兼容（反代）"],
       ];
     }
     if (p.id === "gemini") {
@@ -547,11 +626,11 @@
     if (ptype === "openai") {
       if (id === "chatgpt") return "https://api.openai.com/v1";
       if (id === "gemini") return "https://generativelanguage.googleapis.com/v1beta/openai";
+      if (id === "claude") return "https://api.anthropic.com/v1";
       return "";
     }
     if (ptype === "gemini_native") return "https://generativelanguage.googleapis.com/v1beta";
     if (ptype === "chatgpt_web") return "https://chatgpt.com";
-    if (ptype === "claude_web") return "https://claude.ai/api";
     return "";
   }
 
@@ -559,7 +638,7 @@
     const box = $("providerCards");
     box.innerHTML = "";
     cfg.providers.forEach((p) => {
-      const isWeb = p.ptype === "chatgpt_web" || p.ptype === "claude_web";
+      const isWeb = p.ptype === "chatgpt_web";
       const isGemini = p.ptype === "gemini_native";
       const urlLabel = isWeb
         ? "站点地址（协议根地址）"
@@ -701,7 +780,7 @@
     if (!p) return;
 
     // 按钮按端点类型只显示一个（已知问题 2：网页版与 Key 类不再弹同一个窗）
-    const isWebProvider = p.ptype === "chatgpt_web" || p.ptype === "claude_web";
+    const isWebProvider = p.ptype === "chatgpt_web";
     const loginBtn = $("webLoginBtn");
     loginBtn.textContent = isWebProvider ? "🌐 网页登录抓 Token" : "＋ 添加 API Key";
     loginBtn.classList.toggle("hidden", false);
@@ -709,7 +788,7 @@
 
     const list = [...p.accounts].sort((a, b) => a.priority - b.priority);
     if (list.length === 0) {
-      const isWeb = p.ptype === "chatgpt_web" || p.ptype === "claude_web";
+      const isWeb = p.ptype === "chatgpt_web";
       const empty = el(`<div class="acc-empty">
         <div class="hint">${
           isWeb
@@ -807,7 +886,7 @@
     const p = cfg.providers.find((x) => x.id === pid);
     if (!p) return;
     // 网页版协议要走抓取流程，不是填 Key
-    if (p.ptype === "chatgpt_web" || p.ptype === "claude_web") {
+    if (p.ptype === "chatgpt_web") {
       openCapture(pid);
       return;
     }
@@ -843,7 +922,6 @@
     const k = String(raw || "").replace(/\s+/g, "");
     if (/^AIza[0-9A-Za-z_\-]{10,}/.test(k)) return { pid: "gemini", label: "Gemini" };
     if (/^sk-ant-api/.test(k)) return { pid: "claude", label: "Anthropic 官方 Key" };
-    if (/^sk-ant-sid/.test(k)) return { pid: "claude", label: "Claude sessionKey" };
     if (/^sk-[A-Za-z0-9]{20,}/.test(k)) return { pid: "deepseek", label: "DeepSeek/OpenAI 风格" };
     return null;
   }
@@ -949,35 +1027,16 @@
     }
     $("capStatus").className = "cap-status";
     $("capStatus").textContent = "";
-    const isClaude = p.ptype === "claude_web";
     const isChatgpt = p.ptype === "chatgpt_web";
     $("capCookieWrap").classList.remove("hidden");
     $("capOauthWrap").classList.toggle("hidden", !isChatgpt);
-    $("capCookieLabel").textContent = isClaude
-      ? "完整 Cookie（强烈建议粘贴，否则容易被风控）"
-      : "Cookie（可选，推荐一并粘贴以提高成功率）";
-    $("capCookie").placeholder = isClaude
-      ? "从 claude.ai 复制整条 Cookie（含 cf_clearance / __cf_bm / sessionKey），能显著降低 403 风控"
-      : "从浏览器复制的完整 Cookie";
-    $("capTitle").textContent = isClaude
-      ? "Claude 网页版登录"
-      : isChatgpt
+    $("capCookieLabel").textContent = "Cookie（可选，推荐一并粘贴以提高成功率）";
+    $("capCookie").placeholder = "从浏览器复制的完整 Cookie";
+    $("capTitle").textContent = isChatgpt
       ? "ChatGPT 登录（一键 OAuth）"
       : "抓取登录 Token";
 
-    if (isClaude) {
-      $("capInputLabel").textContent = "粘贴 sessionKey";
-      $("capInput").placeholder = "从 claude.ai 的 Cookie 中复制 sessionKey 的值";
-      $("capSteps").innerHTML =
-        "<b>获取 Claude 的登录态：</b><br>" +
-        "1. 新标签打开 <code>claude.ai</code> 并登录<br>" +
-        "2. 按 <code>F12</code> → <b>Application（应用）</b> → <b>Cookies</b> → <code>https://claude.ai</code><br>" +
-        "3. 找到 <code>sessionKey</code>，复制其 <b>Value</b> 填到下面<br>" +
-        "4. <b>强烈建议</b>：把该站点下<b>所有 Cookie 整条</b>（含 <code>cf_clearance</code>、<code>__cf_bm</code>）粘到「完整 Cookie」里——" +
-        "Claude 用 Cloudflare 防护，只带 sessionKey 很容易被 403 风控<br>" +
-        "5. 点「验证并添加」<br>" +
-        '<span style="opacity:.75">注：sessionKey 是 HttpOnly，脚本读不到，只能手动复制。</span>';
-    } else if (isChatgpt) {
+    if (isChatgpt) {
       $("capInputLabel").textContent = "或手动粘贴 accessToken（可选）";
       $("capInput").placeholder = '{"token":"...","cookie":"..."} 或直接粘贴 accessToken';
       const bm = bookmarkletSrc();
@@ -1102,12 +1161,8 @@
       status.textContent = "验证通过 ✓" + (who ? "（" + who + "）" : "");
       if (verifyOnly) return;
 
-      const accName =
-        parsed.name || who || (p.ptype === "claude_web" ? "Claude 账号" : "ChatGPT 账号");
-      const meta =
-        p.ptype === "claude_web"
-          ? { org_uuid: r.org_uuid }
-          : { user_id: r.user_id, email: r.email };
+      const accName = parsed.name || who || "ChatGPT 账号";
+      const meta = { user_id: r.user_id, email: r.email };
       await invoke("capture-login-token", {
         provider_id: capturePid,
         secret: parsed.secret,
@@ -1133,7 +1188,7 @@
     const pid = $("acctProviderSel").value;
     const p = cfg.providers.find((x) => x.id === pid);
     if (!p) return;
-    if (p.ptype === "chatgpt_web" || p.ptype === "claude_web") {
+    if (p.ptype === "chatgpt_web") {
       openCapture(pid);
     } else {
       // Key 类端点：直接弹出填 Key 表单（不再只弹一行提示）
@@ -1281,6 +1336,8 @@
 
     // 🎨 生图开关
     $("imgToggle").onclick = () => setImageMode(!imageMode);
+    // 🧩 Agent 开关
+    $("agentToggle").onclick = () => setAgentMode(!agentMode);
 
     // 📎 上传
     $("attachBtn").onclick = () => $("fileInput").click();

@@ -432,3 +432,27 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
   white-space: pre-wrap; max-height: 240px; overflow: auto;
 }
 .fetch-models { margin-left: 8px; padding: 1px 8px; font-size: 11px; }
+
+/* 🧩 Agent 工具调用时间线 */
+.agent-timeline {
+  margin: 0 0 8px; padding: 8px 10px;
+  border: 1px solid var(--border); border-left: 2px solid var(--accent);
+  border-radius: 8px; background: var(--bg-2);
+  display: flex; flex-direction: column; gap: 5px;
+}
+.agent-step {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 12px; line-height: 1.5; color: var(--text-dim);
+}
+.agent-step .ic { flex: none; width: 14px; text-align: center; }
+.agent-step .an { flex: none; font-weight: 600; color: var(--accent-2); }
+.agent-step .aq {
+  flex: 1; min-width: 0; color: var(--text-dim2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.agent-step.running .ic { color: var(--accent); }
+.agent-step.running .aq { font-style: italic; }
+.agent-step.ok .ic { color: #4ec9a8; }
+.agent-step.fail .ic { color: #e0644a; }
+.agent-step .spin { display: inline-block; animation: agent-spin 1s linear infinite; }
+@keyframes agent-spin { to { transform: rotate(360deg); } }

@@ -1,8 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
+mod agent_tools;
 mod chat;
 mod chat_attach;
 mod config;
+mod docext;
 mod files;
 mod gemini;
 mod history;

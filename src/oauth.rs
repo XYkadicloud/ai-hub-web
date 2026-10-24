@@ -406,7 +406,7 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-/// 生成标准 UUID v4（Claude 的 turn_message_uuid 等需要）。
+/// 生成标准 UUID v4（消息 id / 会话 id 用）。
 pub fn uuid_v4() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);

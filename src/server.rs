@@ -296,9 +296,6 @@ async fn verify_account(
         "chatgpt_web" => {
             webchat::verify_chatgpt(&b.secret, b.cookie.as_deref(), &p.base_url).await
         }
-        "claude_web" => {
-            webchat::verify_claude(&b.secret, b.cookie.as_deref(), &p.base_url).await
-        }
         "gemini_native" => {
             crate::gemini::verify_key(&p.base_url, &b.secret, p.proxy.as_deref()).await
         }
@@ -408,7 +405,7 @@ async fn list_models(
 
     let res: Result<Vec<String>, String> = if p.ptype == "gemini_native" {
         crate::gemini::list_models(&p.base_url, &key, p.proxy.as_deref()).await
-    } else if p.ptype == "chatgpt_web" || p.ptype == "claude_web" {
+    } else if p.ptype == "chatgpt_web" {
         return Ok(Json(json!({ "models": p.models })));
     } else {
         let client = crate::providers::build_client(p)?;
@@ -472,6 +469,9 @@ struct ChatBody {
     /// 🎨 生图开关（手动）；模型名命中生图模型时后端也会自动走生图分支。
     #[serde(default)]
     image_mode: bool,
+    /// 是否启用 Agent 模式（工具调用 + 联网）。仅对 API 协议生效。
+    #[serde(default)]
+    agent_mode: bool,
 }
 async fn chat(State(s): State<AppState>, Json(b): Json<ChatBody>) -> Result<Json<Value>, AppErr> {
     let (mtx, mut mrx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
@@ -481,6 +481,7 @@ async fn chat(State(s): State<AppState>, Json(b): Json<ChatBody>) -> Result<Json
     let msgs = b.messages.clone();
     let conv_for_chat = b.conv_id.clone();
     let image_mode = b.image_mode;
+    let agent_mode = b.agent_mode;
 
     // 登记中止标志；同会话上次还在跑的任务先停掉
     let flag: AbortFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -500,6 +501,7 @@ async fn chat(State(s): State<AppState>, Json(b): Json<ChatBody>) -> Result<Json
             &conv_for_chat,
             mtx,
             image_mode,
+            agent_mode,
             Some(flag_for_task),
         )
         .await;
@@ -521,6 +523,15 @@ async fn chat(State(s): State<AppState>, Json(b): Json<ChatBody>) -> Result<Json
                     json!({"conv_id": conv_id, "delta": r}),
                 ),
                 ChatEvent::Active { account } => ("account_ok", json!({"account": account})),
+                ChatEvent::ToolCall { name, args } => (
+                    "agent_tool",
+                    json!({"conv_id": conv_id, "phase": "call", "name": name, "args": args}),
+                ),
+                ChatEvent::ToolResult { name, ok, summary } => (
+                    "agent_tool",
+                    json!({"conv_id": conv_id, "phase": "result", "name": name,
+                           "ok": ok, "summary": summary}),
+                ),
                 ChatEvent::Switch { account, reason } => {
                     ("account_switch", json!({"account": account, "reason": reason}))
                 }
@@ -1113,23 +1124,38 @@ fn serve_asset(s: &AppState, path: &str) -> Response {
         (StatusCode::NOT_FOUND, "not found").into_response()
     }
 }
+/// 按扩展名推断 Content-Type（覆盖聊天附件常见类型，不只是 web 资源）。
+/// 之前只认 html/js/css/图片，导致 txt/md/pdf/csv 一律 `octet-stream`，
+/// 浏览器只会下载而不会内联预览。
 fn content_type(path: &str) -> String {
-    let ext = path.rsplit('.').next().unwrap_or("");
-    let m = match ext {
-        "html" => "text/html; charset=utf-8",
+    let ext = match path.rsplit_once('.') {
+        Some((_, e)) => e.to_ascii_lowercase(),
+        None => String::new(),
+    };
+    let m = match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
-        "json" | "map" => "application/json",
+        "json" | "map" | "jsonl" => "application/json; charset=utf-8",
+        "xml" => "text/xml; charset=utf-8",
+        "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
         "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
         "ico" => "image/x-icon",
+        "avif" => "image/avif",
         "woff2" => "font/woff2",
         "woff" => "font/woff",
         "ttf" => "font/ttf",
+        "txt" | "log" | "srt" | "vtt" => "text/plain; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "csv" | "tsv" => "text/csv; charset=utf-8",
+        "py" | "rs" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "cs" | "sh" | "bash" | "zsh"
+        | "ps1" | "bat" | "cmd" | "sql" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf"
+        | "tsx" | "jsx" | "ts" => "text/plain; charset=utf-8",
+        "pdf" => "application/pdf",
         _ => "application/octet-stream",
     };
     m.to_string()

@@ -88,12 +88,18 @@ fn hashed_name(bytes: &[u8], ext: &str) -> String {
     }
 }
 
+/// 取扩展名。注意必须用 `rsplit_once('.')`：`"README".rsplit('.').next()`
+/// 会返回整个字符串（split 至少产出一个元素），于是无扩展名文件的 id 会被
+/// 拼成 `xxx.readme`。
 fn ext_of(name: &str) -> String {
-    name.rsplit('.').next().unwrap_or("").to_string()
+    match name.rsplit_once('.') {
+        Some((_, e)) => e.to_string(),
+        None => String::new(),
+    }
 }
 
 /// 保存一份上传文件，返回可供前端引用的元数据。
-/// 文本类文件会顺带读出截断内容（`text` 字段）。
+/// 文本类文件会顺带读出截断内容（`text` 字段）；PDF / Office 也尽量提取文本。
 pub fn save_upload(dir: &Path, name: &str, mime: &str, bytes: &[u8]) -> Result<SavedFile, String> {
     let d = uploads_dir(dir);
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
@@ -103,10 +109,12 @@ pub fn save_upload(dir: &Path, name: &str, mime: &str, bytes: &[u8]) -> Result<S
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     }
     let kind = detect_kind(mime, name);
-    let text = if kind == FileKind::Text {
-        Some(read_text_truncated(bytes))
-    } else {
-        None
+    let text = match kind {
+        FileKind::Text => Some(read_text_truncated(bytes)),
+        // PDF / Office 不再只能报文件名：尽力抽出正文，失败仍降级为「仅文件名」
+        FileKind::Other => crate::docext::extract_text(bytes, mime, name)
+            .map(|t| t.chars().take(MAX_INLINE_TEXT).collect()),
+        FileKind::Image => None,
     };
     Ok(SavedFile {
         id,

@@ -1,7 +1,9 @@
 # AI Hub Web · 交接文档
 
-> 版本：v0.1.0　｜　最后更新：2026-10-24
+> 版本：v0.2.0　｜　最后更新：2026-10-24
 > 定位：轻量级「一站式 AI 聊天客户端」，本地 HTTP 服务 + 系统默认浏览器，零 WebView2 依赖。
+> 本版新增：**Agent 模式（模型自主调用工具，仅 API 端点）**、上传机制重做（PDF/Office 文本提取）、
+> 删除 Claude 网页版（改用 Claude API，openai 协议，默认关闭）。
 
 ---
 
@@ -31,15 +33,17 @@
 | OpenAI 兼容协议（DeepSeek / 中转站 / 自建反代） | ✅ | mock 服务端到端 + 真实 HTTPS 探测 |
 | Gemini **原生**协议（非兼容层） | ✅ | mock 原生协议端到端 |
 | ChatGPT 网页版协议（含 PoW 求解） | ✅ **真机跑通** | 真实 OAuth 账号对话 + 多轮上下文 |
-| Claude 网页版协议（sessionKey） | ⚠️ 协议跑通，账号限流 | 真机 429（额度问题，非代码问题） |
+| ~~Claude 网页版协议~~ | ❌ **已删除** | 账号 429 限流 + 封号风险；改为 Claude API（openai 协议，默认关闭） |
+| **Agent 模式**（模型自主调用工具） | ✅ **真机跑通** | Gemini 原生协议：时间/计算双工具、联网搜索串抓网页 |
+| **联网搜索工具**（`web_search` + `fetch_url`） | ✅ | 真机：搜索 Rust 版本 → 抓 releases.rs → 答 1.99.1 |
 | 账号池 + 自动故障转移（401/403/429/额度） | ✅ | mock 触发切换 |
 | 多轮上下文（含网页版会话/父消息 ID 持久化） | ✅ | 两协议第二轮测试 |
 | 会话历史本地持久化 | ✅ | 跨重启读取 |
 | 流式输出（SSE） | ✅ | 逐字增量推送 |
-| 浏览器 UI（设置、账号池、抓取弹窗、Key 表单） | ✅ | Playwright 真实浏览器，零 JS 错误 |
+| 浏览器 UI（设置、账号池、抓取弹窗、Key 表单、Agent 开关） | ✅ | Playwright 真实浏览器，零 JS 错误 |
 | Windows 交叉编译 | ✅ | `x86_64-pc-windows-gnu`，仅依赖系统 DLL |
 | **生图**（🎨 开关 + 模型名自动识别） | ✅ 代码完成 | `/images/generations` → base64 落盘 → SSE 推 Markdown 图片 |
-| **文件上传**（📎 + 拖拽，图片/文本/文件） | ✅ 代码完成 | 原始字节 POST `/api/upload`；图片走多模态，文本内联 |
+| **文件上传**（📎 + 拖拽，图片/文本/文件） | ✅ **已修复重做** | 扩展名推断 + MIME 补全 + PDF/Office 文本提取 |
 | **ChatGPT OAuth 登录**（PKCE + refresh 自动续期） | ✅ 代码完成 | 授权码流程按 `chatgpt2api` 同规格实现；真机待验证 |
 | **书签脚本零粘贴抓取** | ✅ 代码完成 | 页面上下文取 accessToken → CORS POST 回本地服务 → SSE 自动收尾 |
 | **流式取消** | ✅ | `POST /api/chat/stop` + 各协议流式循环检查 |
@@ -50,10 +54,11 @@
 
 | 项 | 说明 |
 |---|---|
-| **ChatGPT 真机实测** | 已跑通（OAuth 账号，单轮 + 多轮）；Claude 真机卡在账号 429 限流 |
+| **ChatGPT 真机实测** | 已跑通（OAuth 账号，单轮 + 多轮） |
+| **Agent 的 OpenAI 兼容协议真机验证** | 代码路径已实现（`agent.rs::run_openai_agent`），因无可用 Key 未实测；Gemini 原生协议已真机跑通。拿到 Key 后跑 `verify-agent.cjs openai` 即可 |
 | **OAuth 真机登录** | 已跑通（Codex loopback 全自动）。若报错，优先核对 `state`、端口是否被防火墙拦 |
 | **Gemini 国内直连** | `generativelanguage.googleapis.com` 国内需代理，无代理不可用 |
-| **ChatGPT / Claude 网页版** | 同样需要能访问对应站点（需代理） |
+| **ChatGPT 网页版** | 需要能访问 chatgpt.com（需代理） |
 | **语音识别** | 产品决策：不做（浏览器原生/后端 whisper 均不实现） |
 | **Gemini 原生生图** | 生图分支只走 OpenAI 兼容 `/images/generations`；Gemini 图片模型（imagen 等）未接 |
 | **安装包** | 目前只产出裸 exe，无安装器、无开机自启、无托盘 |
@@ -87,27 +92,30 @@ ai-hub-web/
 ├── HANDOVER.md               # 本文档（开发向）
 ├── .github/workflows/build.yml  # CI：test + Windows/Linux 双平台 release 构建
 ├── src/
-│   ├── main.rs       (150)   # 入口：数据目录、固定端口、开浏览器、优雅退出、--web-dir/--port
-│   ├── server.rs     (760)   # axum 路由 / REST / SSE / 静态资源 / 上传 / OAuth / 中止
-│   ├── chat.rs       (350)   # 按 ptype 分发 + OpenAI 兼容 SSE + 生图分支 + 账号故障转移
-│   ├── webchat.rs    (940)   # ChatGPT(PoW) / Claude(sessionKey) 两个网页协议 + OAuth 续期
-│   ├── gemini.rs     (410)   # Gemini 原生协议（streamGenerateContent，支持图片 parts）
-│   ├── oauth.rs      (260)   # ChatGPT 官方 OAuth：PKCE、code 兑换、refresh 续期、JWT 解析
-│   ├── chat_attach.rs(180)   # 附件模型 + 多模态内容组装（OpenAI 数组 / Gemini inline_data）
-│   ├── files.rs      (200)   # 上传/生图落盘、安全寻址、附件分类
-│   ├── config.rs     (345)   # 配置与账号池、默认预置、迁移逻辑
-│   ├── history.rs    (175)   # 会话持久化（含 meta 与 attachments）
-│   └── providers.rs  (21)    # URL 拼接 / HTTP Client 构造（含代理）
+│   ├── main.rs       (208)   # 入口：数据目录、固定端口、开浏览器、优雅退出、--web-dir/--port
+│   ├── server.rs     (1162)  # axum 路由 / REST / SSE / 静态资源 / 上传 / OAuth / 中止
+│   ├── chat.rs       (487)   # 按 ptype 分发 + OpenAI 兼容 SSE + 生图分支 + 账号故障转移 + Agent 入口
+│   ├── agent.rs      (668)   # Agent 循环：OpenAI 工具调用 / Gemini functionCall 两协议实现
+│   ├── agent_tools.rs(602)   # Agent 四个内置工具：时间 / 计算 / 联网搜索 / 抓网页
+│   ├── webchat.rs    (1036)  # ChatGPT 网页协议（PoW + OAuth 续期）；Claude 已删除
+│   ├── gemini.rs     (414)   # Gemini 原生协议（streamGenerateContent，支持图片 parts）
+│   ├── oauth.rs      (477)   # ChatGPT 官方 OAuth：PKCE、code 兑换、refresh 续期、JWT 解析
+│   ├── chat_attach.rs(219)   # 附件模型 + 多模态内容组装（OpenAI 数组 / Gemini inline_data）
+│   ├── docext.rs     (366)   # 文档文本提取：PDF（FlateDecode + 字符串对象）/ Office（zip + XML 剥标签）
+│   ├── files.rs      (214)   # 上传/生图落盘、安全寻址、附件分类
+│   ├── config.rs     (389)   # 配置与账号池、默认预置、迁移逻辑
+│   ├── history.rs    (178)   # 会话持久化（含 meta 与 attachments）
+│   └── providers.rs  (137)   # URL 拼接 / HTTP Client 构造（含代理）
 └── web/
-    ├── index.html    (155)
-    ├── style.css     (400)
-    ├── app.js        (1180)
+    ├── index.html    (195)
+    ├── style.css     (458)
+    ├── app.js        (1406)
     └── vendor/
-        ├── tauri-shim.js   (215)  # 浏览器版核心：伪造 window.__TAURI__ + uploadFile
+        ├── tauri-shim.js   (249)  # 浏览器版核心：伪造 window.__TAURI__ + uploadFile
         └── marked.min.js          # Markdown 渲染
 ```
 
-代码总量：Rust 约 2737 行，前端约 1579 行。
+代码总量：Rust 约 6387 行，前端约 2308 行。
 
 ---
 
@@ -128,7 +136,8 @@ tauri-shim.js  ──把 __TAURI__.core.invoke 翻译成 fetch──┐
                                     │   openai        → chat.rs 内置 SSE     │
                                     │   gemini_native → gemini.rs            │
                                     │   chatgpt_web   → webchat.rs           │
-                                    │   claude_web    → webchat.rs           │
+                                    │   agent_mode && ptype != chatgpt_web    │
+                                    │     → agent.rs（模型自主调工具）       │
                                     └───────────────────┬───────────────────┘
                                                         │ ChatEvent
                                                         ▼
@@ -146,14 +155,15 @@ tauri-shim.js  ──把 __TAURI__.core.invoke 翻译成 fetch──┐
 好处：前端只需一条长连接，多标签页也能同时收到。
 
 **ChatEvent 枚举**（`chat.rs`）：
-`Delta(String)` / `Switch{account,reason}` / `Active{account}` / `Done` / `Error(String)`
+`Delta(String)` / `Switch{account,reason}` / `Active{account}` / `Done` / `Error(String)` /
+**`ToolCall{name, args}`** / **`ToolResult{name, ok, summary}`**（后两个仅 Agent 模式产生）
 
 **ServerEvent**（`server.rs`）：`{ event: String, payload: Value }`，
 经 SSE 下发后由 shim 派发为 `listen(event, cb)` 回调。
 
 ---
 
-## 六、四种协议实现细节
+## 六、协议实现细节（三种 ptype + Agent 模式）
 
 ### 6.1 `openai` —— OpenAI 兼容
 
@@ -289,33 +299,55 @@ backend-api 要求**显式声明用哪个账号**，否则 sentinel 接口会抛
 `response.output_text.delta`）。这才是 OAuth token 的原生用法，
 如果当前模型名不被接受（网页版模型和 Codex 模型不是一套），会自动换 `gpt-5` 再试一次。
 
-### 6.4 `claude_web` —— Claude 网页版
+### 6.4 Agent 模式 —— 模型自主调用工具（仅 API 端点）
 
-账号字段：`secret` = **sessionKey**（Cookie 值，HttpOnly，JS 读不到，需手动复制）。
+输入框旁的 🧩 按钮切换。开启后 `POST /api/chat` 带 `agent_mode: true`，
+`chat::stream_chat` 把请求分流到 `agent.rs`，由**模型自己决定**是否调用工具、调几次。
 
-流程（`webchat.rs::claude_send`）：
+**红线（设计决策，勿改）**：
 
-1. **取组织**：GET `/api/account` → `memberships[0].organization.uuid`
-2. **建会话**：POST `/api/organizations/{org}/chat_conversations`
-   body `{"name":"", "model": "..."}` → 返回 `uuid`
-3. **对话**：POST `/api/organizations/{org}/chat_conversations/{uuid}/completion`
-   body 含 `prompt`、`timezone`、`personalized_styles`、`tools`
-   > 不要塞任何自定义字段。加过 `turn_message_uuid`，服务端直接回
-   > `400 invalid_request_error: "turn_message_uuid: Extra inputs are not permitted"`。
-4. **模型名用别名**：`claude-sonnet-4-5` / `claude-opus-4-1` / `claude-3-7-sonnet-latest`。
-   带日期后缀的老名字（如 `claude-sonnet-4-5-20250929`）会回
-   `permission_error: model_not_available`，看起来像账号没权限，其实是名字不对。
-5. **流式**：SSE 事件 `content_block_delta` → `delta.text`；`message_stop` 结束
-6. **多轮**：`meta` 保存 `claude_conv_uuid` 与 `parent_uuid`，续写时带 `parent_message_uuid`
-7. **限流**：429 时读 `anthropic-ratelimit-requests-reset` 头
+> Agent **只走 API 通道**（`openai` 兼容 + `gemini_native`）。
+> `chatgpt_web` 强制不走 Agent——网页端逆向接口 + 高频工具循环几乎必然触发风控封号。
+> 对 `chatgpt_web` 开启 Agent 时，前端会 toast 提示「不支持 Agent（易封号）」，后端同样有兜底分支。
 
-请求头含 `anthropic-client-version`（常量 `2025-04-01`）与桌面 UA。
+**四个内置工具**（`agent_tools.rs`，无外部依赖、免 key）：
 
-> **真机现状（2026-10-24）**：协议层已跑通（不再有 400 / model_not_available），
-> 但测试账号的网页版额度被限流，`completion` 稳定回 **429**。
-> 这是账号层面的额度问题，不是代码问题——换一个未限流的账号即可。
+| 工具 | 参数 | 实现要点 |
+|---|---|---|
+| `get_current_time` | 无 | `chrono::Local` + `Datelike`，输出中文格式 |
+| `calculate` | `expr` | 手写 tokenize → 逆波兰（RPN）→ 栈求值。**不用 eval**，防注入 |
+| `web_search` | `query` | DuckDuckGo HTML 端点（免 key）优先，失败回退 Bing；解析标题 + URL + 摘要 |
+| `fetch_url` | `url` | GET 后剥 `<script>`/`<style>` 取正文，上限 12000 字符 |
 
-> ⚠️ 上述两个网页协议的接口细节来自开源项目 `lanqian528/chat2api` 与 `caiwuu/web2api` 的源码分析。
+**OpenAI 兼容协议循环**（`run_openai_agent`）：
+
+1. 请求体带 `tools: [...]`（`openai_tools(allow_web)` 生成，关联网时可去掉 `web_search`/`fetch_url`）；
+2. 流式响应按 `choices[0].delta.tool_calls[].index` **拼装**分片的工具调用（name/arguments 都是增量到达）；
+3. 收到完整 tool_calls → 推 `ChatEvent::ToolCall` → `run_tool()` 执行 → 结果以
+   `{"role":"tool","tool_call_id":..., "content": ...}` 消息**回填**再请求下一轮；
+4. 模型回纯文本 → 走普通 `Delta` 推送，结束。上限 `max_steps = 6` 轮，防无限循环；
+5. 账号池 failover 与 `chat_urls()` 404/405 回退和普通链路完全一致。
+
+**Gemini 原生协议循环**（`run_gemini_agent`）：
+
+1. 请求体带 `tools: [{functionDeclarations: [...]}]`（`gemini_tools(allow_web)`）；
+2. `streamGenerateContent?alt=sse&key=` 流式解析 `/candidates/0/content/parts`；
+3. 出现 `functionCall` part → 推 `ToolCall` → 执行 → 以
+   `{"role":"user","parts":[{"functionResponse":{"name","response":{...}}}]}` 回填；
+4. 同样 `max_steps = 6` 封顶。
+
+**前端呈现**：SSE 事件 `agent_tool`（`phase: "call" | "result"`）驱动时间线组件——
+每个工具调用一张卡片，运行中转圈、成功 ✓、失败 ✕，附参数与结果摘要（`brief()` 截断）。
+模型最终答复照常走打字机渲染，与 ChatGPT 的「思维链/工具」体验对齐。
+
+**真机验证（2026-10-24）**：
+
+- Gemini 单轮双工具：`get_current_time` + `calculate`，答「现在是2026年10月24日星期六10:16:59。(128+37)*6 的计算结果是 990。」
+- Gemini 联网搜索：自主 `web_search("Rust programming language latest stable version")`
+  → `fetch_url("https://releases.rs/")` → 答「Rust 编程语言最新的稳定版本是 1.99.1。」
+  验证脚本：`verify-agent.cjs`（工具调用）、`verify-agent-search.cjs`（联网搜索）。
+
+> ⚠️ 网页协议（`chatgpt_web`）的接口细节来自开源项目 `lanqian528/chat2api` 与 `caiwuu/web2api` 的源码分析。
 > 官方随时可能变更，失效时请以最新源码为准。
 
 ---
@@ -334,10 +366,10 @@ backend-api 要求**显式声明用哪个账号**，否则 sentinel 接口会抛
 | POST | `/api/accounts/status` | 启用 / 停用账号 |
 | DELETE | `/api/accounts/:id?provider_id=` | 删除账号 |
 | POST | `/api/capture-login-token` | 网页登录抓取的 Token 入库（书签脚本跨域 POST 目标，全局 CORS 已放开） |
-| POST | `/api/verify-account` | **添加前真实校验**：Gemini 走 `models`，ChatGPT 走 session 接口，Claude 走 `/api/account` |
+| POST | `/api/verify-account` | **添加前真实校验**：Gemini 走 `models`，ChatGPT 走 session 接口，其余（OpenAI 兼容，含 Claude API）走 `/models` 探针 |
 | POST | `/api/models` | 拉取可用模型列表 |
 | GET | `/api/version` | 版本 + 构建时间（界面底部展示，用于核对 exe 新旧） |
-| POST | `/api/chat` | 发起对话（body: provider_id / model / messages / conv_id / image_mode） |
+| POST | `/api/chat` | 发起对话（body: provider_id / model / messages / conv_id / image_mode / **agent_mode**） |
 | POST | `/api/chat/stop` | 停止某会话的流式输出（body: `{conv_id}`） |
 | POST | `/api/upload` | 原始字节上传附件（query: name/mime，body 为字节） |
 | GET | `/api/files/:id` | 读取上传的附件文件 |
@@ -351,7 +383,7 @@ backend-api 要求**显式声明用哪个账号**，否则 sentinel 接口会抛
 | DELETE | `/api/conversations/:id` | 删除会话 |
 | POST | `/api/conversations/:id/rename` | 重命名 |
 | POST | `/api/conversations/:id/messages` | 追加一条消息（body 支持 `attachments`） |
-| GET | `/api/events` | **SSE 长连接**，推送 `chat_stream` / `account_ok` / `account_switch` / `login-captured` 等 |
+| GET | `/api/events` | **SSE 长连接**，推送 `chat_stream` / `account_ok` / `account_switch` / `login-captured` / **`agent_tool`** 等 |
 | POST | `/api/quit` | 页面关闭通知（sendBeacon）：设 8s 退出死线，期间任何请求都会取消 |
 | POST | `/api/ping` | 前端 5s 心跳，用于「还有标签页开着」的存活判定 |
 | GET | `/api/debug-exit` | 诊断：查看退出死线 / SSE 计数 / should_quit |
@@ -390,7 +422,7 @@ ai-hub/
   "providers": [{
     "id": "deepseek",
     "name": "DeepSeek",
-    "ptype": "openai",              // openai | gemini_native | chatgpt_web | claude_web
+    "ptype": "openai",              // openai | gemini_native | chatgpt_web
     "base_url": "https://api.deepseek.com/v1",
     "models": ["deepseek-chat"],
     "default_model": "deepseek-chat",
@@ -400,9 +432,9 @@ ai-hub/
       "id": "…",
       "name": "我的账号",
       "cred_type": "api_key",       // api_key | token
-      "secret": "sk-…",             // API Key / accessToken / sessionKey
+      "secret": "sk-…",             // API Key / accessToken
       "cookie": null,               // ChatGPT 网页版用
-      "meta": null,                 // Claude 的 org_uuid 等
+      "meta": null,                 // ChatGPT 的 chatgpt_account_id 等
       "status": "active",           // active | disabled | error | expired
       "priority": 0
     }]
@@ -410,14 +442,18 @@ ai-hub/
 }
 ```
 
+> Claude 已改为普通 `openai` 类型 provider（`base_url = https://api.anthropic.com/v1`，
+> 默认 `enabled: false`）。删掉的 `claude_web` 类型由 `config::backfill_chatgpt_meta()` 等
+> 启动迁移逻辑保证旧配置不炸。
+
 ### 会话 meta（网页协议多轮状态）
 
 ```json
 {
   "conversation_id": "…",       // ChatGPT
   "parent_message_id": "…",     // ChatGPT
-  "claude_conv_uuid": "…",      // Claude
-  "parent_uuid": "…"            // Claude
+  "chatgpt_account_id": "…",    // ChatGPT（启动时自动 backfill）
+  "plan_type": "free"           // ChatGPT
 }
 ```
 
@@ -483,27 +519,29 @@ ai-hub-web.exe --web-dir ./web # 从磁盘读前端，改完刷新即可生效�
 
 | 类型 | 做法 |
 |---|---|
-| 单元测试 | `cargo test`（9 项）：PKCE RFC 向量、JWT claim 解析、PoW 求解与**载荷 JSON 合法性**、设备 ID 稳定性、base_url 归一化 |
-| 协议级 mock | Python 起 mock 服务，严格复刻 ChatGPT sentinel+PoW、Claude SSE、Gemini 原生 SSE |
+| 单元测试 | `cargo test`（21 项）：PKCE RFC 向量、JWT claim 解析、PoW 求解与**载荷 JSON 合法性**、设备 ID 稳定性、base_url 归一化、RPN 计算器、HTML 剥标签、PDF 字符串/八进制转义、Office 魔数识别 |
+| 协议级 mock | Python 起 mock 服务，严格复刻 ChatGPT sentinel+PoW、Gemini 原生 SSE |
 | API 级 | Python/Node 脚本走 REST + SSE，校验逐字增量与事件序列 |
-| **真机在线验证** | `verify-live.cjs <provider>`、`verify-chatgpt-live.cjs`、`verify-chatgpt-multi.cjs` |
+| **真机在线验证** | `verify-live.cjs <provider>`、`verify-chatgpt-live.cjs`、`verify-chatgpt-multi.cjs`、`verify-agent.cjs`、`verify-agent-search.cjs` |
 | UI 级 | Playwright 真实 Chromium，检查 DOM、弹窗、零 JS 错误、截图 |
 
 ### 关键验证结论（2026-10-24 更新）
 
-- `cargo test` **9/9 通过**
+- `cargo test` **21/21 通过**
 - **ChatGPT 真机**：单轮 `只回复两个字：收到` ✅；多轮记忆（7391）✅
 - **Gemini 真机**：`gemini-2.5-flash` ✅
-- **Claude 真机**：协议通过，账号 429 限流 ⚠️
+- **Agent 真机（Gemini）**：双工具调用 ✅；联网搜索 → 抓网页 → 作答闭环 ✅
+- **Agent（OpenAI 兼容）**：代码路径已实现，无 Key 未实测（见「待办」）
 - 通用 OpenAI 兼容：6 项端到端全过（404 回退 / 思考过程 / 可读错误 / 拉取模型）
 - 退出逻辑：无页面 9s 退、页面开着不误杀、页面离开 11.5s 退
 
 ### 复现测试的建议顺序
 
-1. `cargo test` —— 先确认 PoW 与解析没坏
+1. `cargo test` —— 先确认 PoW、RPN、文档提取没坏
 2. 起服务后 `node verify-live.cjs chatgpt` —— 真机冒烟
-3. 起 mock → 改 `base_url` 指向 mock → 走完整 chat（`verify-openai.cjs`）
-4. Playwright 跑 UI 回归（注意用 `domcontentloaded`，**不要用 `networkidle`**，
+3. 起服务后 `node verify-agent.cjs gemini` —— Agent 工具调用真机冒烟
+4. 起 mock → 改 `base_url` 指向 mock → 走完整 chat（`verify-openai.cjs`）
+5. Playwright 跑 UI 回归（注意用 `domcontentloaded`，**不要用 `networkidle`**，
    因为 SSE 长连接会让网络永不空闲）
 
 ---
@@ -512,7 +550,7 @@ ai-hub-web.exe --web-dir ./web # 从磁盘读前端，改完刷新即可生效�
 
 ### 1. ~~缺少「接入方式」切换 UI~~ —— 已修复
 
-每张服务卡现有「接入方式」下拉：ChatGPT / Claude 可切「网页版 ⇄ OpenAI 兼容（反代）」，
+每张服务卡现有「接入方式」下拉：ChatGPT 可切「网页版 ⇄ OpenAI 兼容（反代）」，
 Gemini 可切「官方原生 ⇄ OpenAI 兼容层」，切换时联动字段标签与账号池按钮。
 
 ### 2. ~~账号池两个按钮对网页版端点行为相同~~ —— 已修复
@@ -529,7 +567,13 @@ PoW 载荷 JSON 缺结尾 `]` 且 `i>>1` 位置错（详见 6.3 与 6.3.2）。
 真机再失效时的排查顺序：
 `chatgpt-account-id` → sentinel 返回体 → PoW 载荷是否合法 JSON → conversation 请求体字段。
 
-Claude 侧：协议层已通（不再 400 / model_not_available），当前卡在账号 429 限流。
+### 3.5 ~~Claude 网页版~~ —— 已删除（2026-10-24）
+
+协议层曾跑通（400 / model_not_available 都修掉了），但测试账号稳定 429 限流，
+且网页逆向 + Agent 工具循环叠加后封号风险不可接受。按用户决策整体删除
+（约 300 行：`claude_send` / `claude_headers` / `verify_claude` / `handle_claude_event` /
+`claude_web` 分发分支 / 前端抓取弹窗）。现 Claude 以官方 API 形态保留为
+`openai` 类型 provider，默认关闭，需要时在设置里打开即可。
 
 ### 4. ~~流式取消未实现~~ —— 已实现
 
@@ -556,28 +600,44 @@ Claude 侧：协议层已通（不再 400 / model_not_available），当前卡�
 `/images/generations` 分支只对 `openai` 类型 provider 生效；
 Gemini 原生图片模型（imagen 等）与网页版协议内的生图均未接。
 
+### 9. Agent 的已知局限
+
+- **OpenAI 兼容协议未真机验证**：`run_openai_agent` 的 tool_calls 拼装 / `role:"tool"` 回填
+  只有代码与 mock 级保障，等有 Key 后跑 `verify-agent.cjs openai` 补验。
+- **无并发工具调用压力测试**：模型一次回多个 tool_calls 时按序执行（未并行），
+  多个 `web_search` 连发时总耗时 = 各次之和。
+- **Agent 与网页版互斥**：`chatgpt_web` 下 Agent 开关点了也会被后端忽略（防封号），
+  前端会 toast 说明。
+- **工具结果截断**：`fetch_url` 上限 12000 字符、`web_search` 上限 8 条，
+  超长内容由 `brief()` 再截断，模型可能拿不到完整信息。
+- **上传文本注入**：上传的 txt/md/csv 会全文内联进 prompt，无长度上限保护
+  （当前靠 `attachments` 体积直觉约束），极端大文件建议后续加截断。
+
 ---
 
 ## 十二、后续待办建议
 
 按性价比排序：
 
-1. **OAuth / 网页版真实账号回归测试** —— 有 ChatGPT 账号后跑一遍 OAuth 登录与续期，记录失效点
-2. **Gemini 原生生图**（imagen / 图片预览模型走 `generateContent`）
-3. **ChatGPT 网页版生图**（`/backend-api/files` 上传 + 多模态消息）
-4. **Claude 官方 API 协议**（`/v1/messages` + `x-api-key`），比网页版稳定
-5. **安装包**：NSIS / MSI，带开始菜单快捷方式与卸载
-6. **托盘 + 单实例**：避免重复启动起多个服务（固定端口已部分缓解）
-7. **会话搜索 / 导出 Markdown**
-8. **代理配置细化**：目前是整服务一个 proxy，可细化到「仅网页版走代理」
+1. **Agent 的 OpenAI 兼容协议真机回归** —— 有任意 OpenAI 兼容 Key（DeepSeek / 中转）即可跑
+   `verify-agent.cjs openai`，补上 `role:"tool"` 回填的真机验证
+2. **OAuth / 网页版真实账号回归测试** —— ChatGPT OAuth 登录续期已跑通一次，定期回归记录失效点
+3. **Gemini 原生生图**（imagen / 图片预览模型走 `generateContent`）
+4. **ChatGPT 网页版生图**（`/backend-api/files` 上传 + 多模态消息）
+5. **Agent 体验深化**：工具调用并行化、`web_search` 结果缓存、上传文档直接喂 Agent 总结
+6. **安装包**：NSIS / MSI，带开始菜单快捷方式与卸载
+7. **托盘 + 单实例**：避免重复启动起多个服务（固定端口已部分缓解）
+8. **会话搜索 / 导出 Markdown**
+9. **代理配置细化**：目前是整服务一个 proxy，可细化到「仅网页版走代理」
 
 ---
 
 ## 十三、合规与风险声明
 
 - 本项目是**可配置端点的客户端**：不内置、不分发任何 API Key 或共享账号。
-- `chatgpt_web` / `claude_web` 通过**用户自己的登录态**访问网页接口，
+- `chatgpt_web` 通过**用户自己的登录态**访问网页接口，
   这类用法**可能违反对应服务的条款**，存在封号风险，由使用者自行承担。
+- 正因如此，**Agent（工具循环）被限制为只走 API 通道**，不碰网页端——这是产品决策而非技术限制。
 - 逆向接口随官方更新随时可能失效，**不承诺长期可用**。
 - 需要长期稳定，请优先使用官方 API（DeepSeek / Gemini 官方 Key）或自建合规反代。
 - 所有数据仅存本机，不上传任何服务器。
