@@ -1,6 +1,6 @@
 [package]
 name = "ai-hub-web"
-version = "0.1.0"
+version = "0.2.0"
 description = "轻量一站式 AI 聊天整合客户端 · 本地服务 + 浏览器版（无 WebView2 依赖）"
 edition = "2021"
 
